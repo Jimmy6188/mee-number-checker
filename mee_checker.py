@@ -59,8 +59,24 @@ SP_WIN = 95.0          # 二级匹配: 插值期望位置窗口 (pt)
 SP_DEV_TOL = 75.0      # 二级匹配: 实际位置与期望的最大偏差 (pt)
 SNAP_PAD = 55          # 截图外扩边距 (pt)
 SNAP_DPI = 150         # 截图分辨率
+# 锚定/高亮颜色参数(客户标注颜色, 可调; 容差容忍偏色)
+ANCHOR_RED = (1.0, 0.0, 0.0)      # 红框(客户 Square 批注)基准色
+ANCHOR_FILL = (0.0, 1.0, 1.0)     # 高亮文字填充基准色(青)
+COLOR_TOL = 0.08                  # 颜色容差
+
+
+def _color_match(c: tuple, target: tuple) -> bool:
+    """颜色近似匹配(绝对值容差), 兼容 0-1 浮点"""
+    if c is None:
+        return False
+    return all(abs(a - b) <= COLOR_TOL for a, b in zip(c, target))
 
 TOKEN_RE = re.compile(r'\d+(?:[.,]\d+)*')
+# 语言无关 Token(单位/型号/符号): 用于数字身份指纹
+FP_RE = re.compile(r'(N[·•.]?m|kgf[·•.]?cm|kgf/cm|MPa|kPa|mm²|mm|Hz|°C|psi|bar|kg/cm|m³|R290|R32|R410A?|MSZ-|MUZ-|MAC-|WPA|Wi-Fi|R29\d|R3\d|ø|±|×|∅|%)', re.I)
+
+# 不进入问题项统计/截图/报告的状态(供统一排除)
+IGNORED_STATUSES = ('已并入聚合差异', '非锚定区(忽略)')
 
 # ---------------- 数据结构 ----------------
 @dataclass
@@ -72,6 +88,7 @@ class Item:
     n_spans: int
     left_ctx: str = ''   # 骨架上下文: 同行紧邻左侧非红文本尾部
     right_ctx: str = ''  # 骨架上下文: 同行紧邻右侧非红文本头部
+    fp: str = ''         # 语义指纹: 数字邻接的语言无关token(单位/型号/符号)
 
     @property
     def xc(self) -> float:
@@ -111,6 +128,194 @@ def is_red_loose(color: int) -> bool:
 
 def is_red(color: int) -> bool:
     return is_red_core(color) or is_red_loose(color)
+
+
+def _split_number_segments(sp: dict) -> list:
+    """把 span 切分为数字 token 子 span(按字符宽度比例估算位置)。
+    返回含数字 token 的子 span dict 列表(bbox 按 span 内字符位置线性插值)。"""
+    text = sp["text"]
+    x0, x1 = sp["bbox"][0], sp["bbox"][2]
+    ws = x1 - x0
+    n = len(text)
+    if n <= 0 or ws <= 0:
+        return []
+    segs = []
+    u = 0
+    while u < n:
+        m = TOKEN_RE.search(text, u)
+        if not m:
+            break
+        s, e = m.start(), m.end()
+        sx = x0 + ws * s / n
+        ex = x0 + ws * e / n
+        seg = dict(sp)
+        seg["text"] = m.group(0)
+        seg["bbox"] = (sx, sp["bbox"][1], ex, sp["bbox"][3])
+        segs.append(seg)
+        u = e
+    return segs
+
+
+def _cluster_spans(pno: int, spans: list, others: list) -> list[Item]:
+    """行聚类 + 间隔聚合 -> 检查点。spans 为待聚合的 span 列表(已筛选),
+    others 为同行非聚合 span(用于点号/逗号插入与骨架上下文)。"""
+    items = []
+    if not spans:
+        return items
+    spans = sorted(spans, key=lambda s: ((s["bbox"][1] + s["bbox"][3]) / 2, s["bbox"][0]))
+    rrows: list[list[dict]] = []
+    for sp in spans:
+        yc = (sp["bbox"][1] + sp["bbox"][3]) / 2
+        if rrows and abs(yc - sum(
+                (s["bbox"][1] + s["bbox"][3]) / 2 for s in rrows[-1]) / len(rrows[-1])) <= LINE_TOL:
+            vert = any(abs(s["bbox"][0] - sp["bbox"][0]) < 2.5
+                       and abs((s["bbox"][1] + s["bbox"][3]) / 2 - yc) > 1.5
+                       for s in rrows[-1])
+            if vert:
+                rrows.append([sp])
+            else:
+                rrows[-1].append(sp)
+        else:
+            rrows.append([sp])
+    for row in rrows:
+        row.sort(key=lambda s: s["bbox"][0])
+        ry = sum((s["bbox"][1] + s["bbox"][3]) / 2 for s in row) / len(row)
+        row_others = sorted([o for o in others if abs(o[3] - ry) <= LINE_TOL + 2],
+                            key=lambda o: o[0])
+        groups: list[list[dict]] = [[row[0]]]
+        for sp in row[1:]:
+            prev = groups[-1][-1]
+            gap = sp["bbox"][0] - prev["bbox"][2]
+            if sp["bbox"][0] < prev["bbox"][2] - 0.3:
+                # x 区间重叠 -> 不是同一行(叠放的两行文本), 必须拆开, 否则误连写(如 60/150)
+                groups.append([sp])
+            elif gap <= GAP_TOL:
+                groups[-1].append(sp)
+            else:
+                groups.append([sp])
+        for g in groups:
+            text = ""
+            prev = None
+            for sp in g:
+                if prev is not None:
+                    gap = sp["bbox"][0] - prev["bbox"][2]
+                    # 两 span 之间的点号/逗号(黑色): 小数/千分位, 直接插入不分隔
+                    dot = ''
+                    for o in row_others:
+                        if prev["bbox"][2] - 0.5 <= o[0] <= sp["bbox"][0] + 0.5 \
+                                and o[1] <= sp["bbox"][0] + 0.5 \
+                                and o[2] in ('.', ',', '．', '，', '·'):
+                            dot = o[2]
+                            break
+                    if dot:
+                        text += dot
+                    else:
+                        text += "" if gap < JOIN_GAP else " "
+                text += sp["text"].strip()
+                prev = sp
+            x0 = min(s["bbox"][0] for s in g)
+            y0 = min(s["bbox"][1] for s in g)
+            x1 = max(s["bbox"][2] for s in g)
+            y1 = max(s["bbox"][3] for s in g)
+            left, right = _make_ctx(row_others, x0, x1)
+            fp = extract_fp(text, left, right)
+            items.append(Item(page=pno, text=text, bbox=(x0, y0, x1, y1),
+                              yc=(y0 + y1) / 2, n_spans=len(g),
+                              left_ctx=left, right_ctx=right, fp=fp))
+    return items
+
+
+def extract_fp(text: str, left_ctx: str = '', right_ctx: str = '', line_full: str = '', header_full: str = '') -> str:
+    """从检查点文本 + 紧邻上下文 + 整行 + 上方表头文本提取语义指纹(单位/型号/符号)。
+    返回归一化指纹串, 无则空。"""
+    for probe in (text + ' ' + right_ctx, text, line_full + ' ' + right_ctx, header_full):
+        if not probe:
+            continue
+        m = FP_RE.search(probe)
+        if m:
+            return m.group(1).lower().replace(' ', '')
+    return ''
+
+
+def anchor_zone_rects(anchor_doc: fitz.Document) -> list:
+    """返回每页的红色 Square 框矩形(客户标注的校对区域)。
+    校对对象 = 红框内的高亮数字; 因此用 Square 框过滤红字检查点。"""
+    per_page = []
+    for pno in range(anchor_doc.page_count):
+        page = anchor_doc[pno]
+        squares = []
+        for a in page.annots():
+            if a.type[1] == 'Square':
+                try:
+                    c = a.colors.get('stroke') or a.colors.get('fill')
+                except AttributeError:
+                    c = None
+                if c and _color_match(c, ANCHOR_RED):
+                    squares.append(fitz.Rect(a.rect))
+        per_page.append(squares)
+    return per_page
+
+
+def in_anchor(item: Item, zones: list) -> bool:
+    """检查点是否落在锚定区域(红色 Square 框)内"""
+    if item.page >= len(zones):
+        return False
+    bb = fitz.Rect(item.bbox)
+    return any(bb.intersects(s) for s in zones[item.page])
+
+
+def extract_anchor_items(doc: fitz.Document) -> list[Item]:
+    """从客户指示原稿提取锚定检查点: Square红框 ∩ 红色高亮矩形 -> 覆盖的数字 span。
+    红框目前为红色 Square 批注; 高亮文字为青色(#00FFFF)填充矩形覆盖的 span。
+    只有框内高亮的文字是校对对象。(后续若颜色变化, 调整阈值即可)"""
+    items = []
+    for pno in range(doc.page_count):
+        page = doc[pno]
+        squares = []
+        for a in page.annots():
+            if a.type[1] != 'Square':
+                continue
+            try:
+                c = a.colors.get('stroke') or a.colors.get('fill')
+            except AttributeError:
+                c = None
+            if c and _color_match(c, ANCHOR_RED):
+                squares.append(fitz.Rect(a.rect))
+        if not squares:
+            continue
+        # 高亮矩形: 青色填充(0,1,1)或高亮批注
+        highlights = [fitz.Rect(dr['rect']) for dr in page.get_drawings()
+                      if dr.get('fill') and _color_match(dr['fill'], ANCHOR_FILL)]
+        highlights += [fitz.Rect(a.rect) for a in page.annots()
+                       if a.type[1] == 'Highlight']
+        in_sq = [h for h in highlights if any(h.intersects(s) for s in squares)]
+        if not in_sq:
+            continue
+        d = page.get_text("dict")
+        spans = []
+        others = []
+        for blk in d.get("blocks", []):
+            if blk.get("type") != 0:
+                continue
+            for line in blk.get("lines", []):
+                for sp in line.get("spans", []):
+                    t = sp["text"].strip()
+                    if not t:
+                        continue
+                    bb = fitz.Rect(sp["bbox"])
+                    if any(h.intersects(bb) for h in in_sq):
+                        # 锚定对象是数字: 把高亮 span 截取为「数字 token 子 span」
+                        # (span 可能含整词如 "4 mm hexagonal wrench", 只取数字段)
+                        segs = _split_number_segments(sp)
+                        if segs:
+                            spans.extend(segs)
+                        else:
+                            others.append([bb[0], bb[2], t, (bb[1] + bb[3]) / 2])
+                    else:
+                        others.append([bb[0], bb[2], t, (bb[1] + bb[3]) / 2])
+        if spans:
+            items.extend(_cluster_spans(pno, spans, others))
+    return items
 
 
 def _make_ctx(others: list, gx0: float, gx1: float):
@@ -176,73 +381,17 @@ def extract_items(doc: fitz.Document, color_counter: Counter | None = None) -> l
                 is_footnote = (prev_txt.endswith('*') and re.fullmatch(r'\d{1,3}', t) is not None)
                 if is_footnote:
                     continue
+                # 上标字符(²/³/¹/ⁿ): 单位的一部分(如 kgf/cm²), 非独立数字, 不作为检查点
+                if t in ('²', '³', '¹', 'ⁿ', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹', '⁰') or re.fullmatch(r'[²³¹ⁿ⁴⁵⁶⁷⁸⁹⁰]+', t):
+                    continue
                 spans.append(sp)
                 if color_counter is not None:
                     color_counter[f'#{sp["color"]:06x}'] += 1
-        # 行聚类(红色): 按 y 中心排序, 相邻 y 中心差 <= LINE_TOL 归入同一行(垂直同列拆行)
-        spans.sort(key=lambda s: ((s["bbox"][1] + s["bbox"][3]) / 2, s["bbox"][0]))
-        rrows: list[list[dict]] = []
-        for sp in spans:
-            yc = (sp["bbox"][1] + sp["bbox"][3]) / 2
-            if rrows and abs(yc - sum(
-                    (s["bbox"][1] + s["bbox"][3]) / 2 for s in rrows[-1]) / len(rrows[-1])) <= LINE_TOL:
-                vert = any(abs(s["bbox"][0] - sp["bbox"][0]) < 2.5
-                           and abs((s["bbox"][1] + s["bbox"][3]) / 2 - yc) > 1.5
-                           for s in rrows[-1])
-                if vert:
-                    rrows.append([sp])
-                else:
-                    rrows[-1].append(sp)
-            else:
-                rrows.append([sp])
-        # 行内按 x 排序, 按间隔聚合为检查点
+        # 行聚类(红色): 由 _cluster_spans 统一处理(行聚类+间隔聚合+点号/逗号+骨架)
         others = [[o["bbox"][0], o["bbox"][2], o["text"].strip(),
                    (o["bbox"][1] + o["bbox"][3]) / 2]
                   for o, red in raw if not red]
-        for row in rrows:
-            row.sort(key=lambda s: s["bbox"][0])
-            ry = sum((s["bbox"][1] + s["bbox"][3]) / 2 for s in row) / len(row)
-            row_others = sorted([o for o in others if abs(o[3] - ry) <= LINE_TOL + 2],
-                                key=lambda o: o[0])
-            groups: list[list[dict]] = [[row[0]]]
-            for sp in row[1:]:
-                prev = groups[-1][-1]
-                gap = sp["bbox"][0] - prev["bbox"][2]
-                if sp["bbox"][0] < prev["bbox"][2] - 0.3:
-                    # x 区间重叠 -> 不是同一行(叠放的两行文本), 必须拆开, 否则误连写(如 60/150)
-                    groups.append([sp])
-                elif gap <= GAP_TOL:
-                    groups[-1].append(sp)
-                else:
-                    groups.append([sp])
-            for g in groups:
-                text = ""
-                prev = None
-                for sp in g:
-                    if prev is not None:
-                        gap = sp["bbox"][0] - prev["bbox"][2]
-                        # 两红色 span 之间的点号/逗号(黑色): 小数/千分位, 直接插入不分隔
-                        dot = ''
-                        for o in row_others:
-                            if prev["bbox"][2] - 0.5 <= o[0] <= sp["bbox"][0] + 0.5 \
-                                    and o[1] <= sp["bbox"][0] + 0.5 \
-                                    and o[2] in ('.', ',', '．', '，', '·'):
-                                dot = o[2]
-                                break
-                        if dot:
-                            text += dot
-                        else:
-                            text += "" if gap < JOIN_GAP else " "
-                    text += sp["text"].strip()
-                    prev = sp
-                x0 = min(s["bbox"][0] for s in g)
-                y0 = min(s["bbox"][1] for s in g)
-                x1 = max(s["bbox"][2] for s in g)
-                y1 = max(s["bbox"][3] for s in g)
-                left, right = _make_ctx(row_others, x0, x1)
-                items.append(Item(page=pno, text=text, bbox=(x0, y0, x1, y1),
-                                  yc=(y0 + y1) / 2, n_spans=len(g),
-                                  left_ctx=left, right_ctx=right))
+        items.extend(_cluster_spans(pno, spans, others))
     return items
 
 # ---------------- 数值归一化与比较 ----------------
@@ -387,52 +536,92 @@ def match_page(en_items: list[Item], xx_items: list[Item], page1: int) -> list[P
     prune_dy = PRUNE_DY if ay else PRUNE_DY_LOOSE
     prune_dx = PRUNE_DX if ax else PRUNE_DX_LOOSE
 
-    # 2) 统一代价矩阵(全部检查点参与)
-    #    剪枝分级: 值相同(强信号)宽松, 值不同(需位置强吻合)紧
+    # 2) 指纹优先配对: 同指纹(单位/型号/符号) + 值相同 -> 直接锁定, 不受坐标漂移影响
+    #    仅当该(指纹,值)在英文/译文两侧都唯一时锁定, 避免抢配(如两个2470同指纹)。
     COST_BIG = 1e6
-    cost = np.full((n, m), COST_BIG)
-    for i, e in enumerate(en_items):
-        for j, x in enumerate(xx_items):
-            dy = abs((x.yc - e.yc) - y_med)
-            dx = abs((x.xc - e.xc) - x_med)
-            same = value_same(e.text, x.text)
-            pdy = PRUNE_DY_SAME if same else prune_dy
-            pdx = PRUNE_DX_SAME if same else prune_dx
-            if dy > pdy or dx > pdx:
-                continue
-            c = dy + W_X * dx + (REWARD_SAME if same else
-                                 (PENALTY_TOK if token_count(e.text) != token_count(x.text)
-                                  else PENALTY_DIFF))
-            # 骨架上下文奖励(确定性信号, 只奖励不惩罚)
-            if e.left_ctx and x.left_ctx and e.left_ctx.lower() == x.left_ctx.lower():
-                c -= REWARD_CTX
-            if e.right_ctx and x.right_ctx and e.right_ctx.lower() == x.right_ctx.lower():
-                c -= REWARD_CTX
-            cost[i, j] = c
-
-    # 3) 全局最优一对一分配
     pairs: list[Pair] = []
     matched: list[tuple[Item, Item]] = []
-    ri, cj = linear_sum_assignment(cost)
-    for i, j in zip(ri, cj):
-        if cost[i, j] >= REJECT_COST or cost[i, j] >= COST_BIG:
+    locked_en: set[int] = set()
+    locked_xx: set[int] = set()
+    # 统计(指纹, 值)与(值)出现次数
+    from collections import Counter as _C
+    en_val_cnt = _C(TOKEN_RE.findall(e.text)[0] for e in en_items if TOKEN_RE.findall(e.text))
+    xx_val_cnt = _C(TOKEN_RE.findall(x.text)[0] for x in xx_items if TOKEN_RE.findall(x.text))
+    en_fp_cnt = _C((e.fp, TOKEN_RE.findall(e.text)[0] if TOKEN_RE.findall(e.text) else '') for e in en_items if e.fp)
+    xx_fp_cnt = _C((x.fp, TOKEN_RE.findall(x.text)[0] if TOKEN_RE.findall(x.text) else '') for x in xx_items if x.fp)
+    for i, e in enumerate(en_items):
+        if not e.fp or i in locked_en:
             continue
-        e, x = en_items[i], xx_items[j]
-        dy = abs((x.yc - e.yc) - y_med)
-        same = value_same(e.text, x.text)
-        if same:
-            conf = 'high' if dy <= CONF_DY_HIGH else 'medium'
-        elif dy <= CONF_DY_MED:
-            conf = 'medium'      # 值不同但位置强吻合: 真实差异典型形态
-        else:
-            conf = 'low'
-        status, note = compare(e.text, x.text)
-        if conf == 'low':
-            note = (note + '; ' if note else '') + '低置信匹配, 建议核对坐标'
-        pairs.append(Pair(cp='', page=page1, en=e, xx=x,
-                          y_off=round(x.yc - e.yc, 1), conf=conf,
-                          status=status, note=note))
-        matched.append((e, x))
+        etoks = TOKEN_RE.findall(e.text)
+        if not etoks:
+            continue
+        val = etoks[0]
+        key = (e.fp, val)
+        if en_fp_cnt[key] > 1 or xx_fp_cnt.get(key, 0) > 1 or en_val_cnt[val] > 1 or xx_val_cnt[val] > 1:
+            continue          # 不唯一 -> 留给匈牙利(避免两个2470同指纹/同值抢配)
+        for j, x in enumerate(xx_items):
+            if j in locked_xx:
+                continue
+            if x.fp and e.fp == x.fp and value_same(e.text, x.text):
+                e2, x2 = en_items[i], xx_items[j]
+                status, note = compare(e2.text, x2.text)
+                dy = x2.yc - e2.yc
+                conf = 'high' if abs(dy) <= CONF_DY_HIGH else 'medium'
+                if '大位移' not in note and '指纹锁定' not in note:
+                    note = (note + '; ' if note else '') + f'指纹锁定({e2.fp})'
+                pairs.append(Pair(cp='', page=page1, en=e2, xx=x2,
+                                  y_off=round(dy, 1), conf=conf,
+                                  status=status, note=note))
+                matched.append((e2, x2))
+                locked_en.add(i)
+                locked_xx.add(j)
+                break
+
+    # 3) 全局最优一对一分配(仅未锁定的检查点)
+    free_en = [i for i in range(n) if i not in locked_en]
+    free_xx = [j for j in range(m) if j not in locked_xx]
+    if free_en and free_xx:
+        fe, fx = len(free_en), len(free_xx)
+        cost_f = np.full((fe, fx), COST_BIG)
+        for a, i in enumerate(free_en):
+            for b, j in enumerate(free_xx):
+                e, x = en_items[i], xx_items[j]
+                dy = abs((x.yc - e.yc) - y_med)
+                dx = abs((x.xc - e.xc) - x_med)
+                same = value_same(e.text, x.text)
+                pdy = PRUNE_DY_SAME if same else prune_dy
+                pdx = PRUNE_DX_SAME if same else prune_dx
+                if dy > pdy or dx > pdx:
+                    continue
+                c = dy + W_X * dx + (REWARD_SAME if same else
+                                     (PENALTY_TOK if token_count(e.text) != token_count(x.text)
+                                      else PENALTY_DIFF))
+                if e.left_ctx and x.left_ctx and e.left_ctx.lower() == x.left_ctx.lower():
+                    c -= REWARD_CTX
+                if e.right_ctx and x.right_ctx and e.right_ctx.lower() == x.right_ctx.lower():
+                    c -= REWARD_CTX
+                cost_f[a, b] = c
+        ri, cj = linear_sum_assignment(cost_f)
+        for a, b in zip(ri, cj):
+            if cost_f[a, b] >= REJECT_COST or cost_f[a, b] >= COST_BIG:
+                continue
+            i, j = free_en[a], free_xx[b]
+            e, x = en_items[i], xx_items[j]
+            dy = abs((x.yc - e.yc) - y_med)
+            same = value_same(e.text, x.text)
+            if same:
+                conf = 'high' if dy <= CONF_DY_HIGH else 'medium'
+            elif dy <= CONF_DY_MED:
+                conf = 'medium'      # 值不同但位置强吻合: 真实差异典型形态
+            else:
+                conf = 'low'
+            status, note = compare(e.text, x.text)
+            if conf == 'low':
+                note = (note + '; ' if note else '') + '低置信匹配, 建议核对坐标'
+            pairs.append(Pair(cp='', page=page1, en=e, xx=x,
+                              y_off=round(x.yc - e.yc, 1), conf=conf,
+                              status=status, note=note))
+            matched.append((e, x))
 
     # 4) 二级匹配: 邻域插值确认大位移
     #    双侧: 唯一值相同候选 + 双侧邻居插值 + 偏差达标;
@@ -665,88 +854,88 @@ def resolve_aggregation(pairs: list[Pair]):
                           f'数字内容一致, 需人工确认排版; 原"{q.en.text}" vs "{q.xx.text}" 已归并')
                 continue
 
-        # 方向四: 区域成组聚合差异。同页 y 邻近(<60pt)的不一致/待人工/译文多出集合, 若
-        # 其 token 全集与英文侧检查点 token 全集数值等效(含点/逗号差异, 无值变化), 判定为
-        # 拆分/聚合排版差异, 全部并入(首个非多出项为主项), 不重复列示。
-        # 安全: 数值等效条件保证真差异(290 vs 29)不会被合并。
-        bypg: dict[int, list[Pair]] = {}
-        for p in pairs:
-            pg = p.en.page if p.en is not None else (p.xx.page if p.xx is not None else None)
-            if pg is not None:
-                bypg.setdefault(pg, []).append(p)
-        for ps in bypg.values():
-            region = [p for p in ps if p.status in ('不一致', '待人工', '译文多出')]
-            if len(region) < 2:
-                continue
-            pend = [p for p in region if p.status in ('不一致', '待人工')]
-            pout = [p for p in region if p.status == '译文多出']
-            if not pend or not pout:
-                continue
-            ys = [p.en.yc if p.en is not None else p.xx.yc for p in region]
-            if max(ys) - min(ys) > 60:
-                continue
-            # 英文侧 token 全集: 待人工/不一致项的 en 检查点
-            en_tokens = []
-            for p in pend:
-                en_tokens.extend(TOKEN_RE.findall(p.en.text))
-            # 译文侧 token 全集: 待人工/不一致已配 xx + 多出 xx
-            xx_tokens = []
-            for p in region:
-                if p.xx is not None:
-                    xx_tokens.extend(TOKEN_RE.findall(p.xx.text))
-            if not en_tokens or not xx_tokens:
-                continue
-            if _multiset_eq(en_tokens, xx_tokens):
-                main = sorted(pend, key=lambda p: p.en.yc)[0]
-                rest = [p for p in region if p is not main]
-                main.status = '疑聚合差异'
-                main.note = (f'疑聚合差异(区域拆分): 英文侧若干检查点数字与译文拆散项数值等效'
-                             f'(含 {len(pout)} 个多出项), 属拆分/聚合排版差异, 需人工确认排版影响; '
-                             f'已并入 {len(rest)} 条')
-                for p2 in rest:
-                    p2.status = '已并入聚合差异'
-                    p2.note = f'已并入同区域疑聚合差异(检查点 {main.cp}), 不再重复计为问题项'
 
-        # 方向五: 未匹配(英文多值聚合) + 多出(译文拆分项)成组, 因排版位移大未配成一对。
-        # 独立遍历(不与方向四耦合, 方向四的 continue 不影响)。
-        for ps in bypg.values():
-            um = [p for p in ps if p.status == '译文未匹配' and p.en is not None]
-            ex = [p for p in ps if p.status == '译文多出' and p.xx is not None]
-            for u in um:
-                utoks = TOKEN_RE.findall(u.en.text)
-                if len(utoks) < 2:
-                    continue
-                cands = [o for o in ex if abs(o.xx.yc - u.en.yc) < 150]
-                if not cands:
-                    continue
-                all_toks = []
+    # 方向四: 区域成组聚合差异。同页 y 邻近(<60pt)的不一致/待人工/译文多出集合, 若
+    # 其 token 全集与英文侧检查点 token 全集数值等效(含点/逗号差异, 无值变化), 判定为
+    # 拆分/聚合排版差异, 全部并入(首个非多出项为主项), 不重复列示。
+    # 安全: 数值等效条件保证真差异(290 vs 29)不会被合并。
+    bypg: dict[int, list[Pair]] = {}
+    for p in pairs:
+        pg = p.en.page if p.en is not None else (p.xx.page if p.xx is not None else None)
+        if pg is not None:
+            bypg.setdefault(pg, []).append(p)
+    for ps in bypg.values():
+        region = [p for p in ps if p.status in ('不一致', '待人工', '译文多出')]
+        if len(region) < 2:
+            continue
+        pend = [p for p in region if p.status in ('不一致', '待人工')]
+        pout = [p for p in region if p.status == '译文多出']
+        if not pend or not pout:
+            continue
+        ys = [p.en.yc if p.en is not None else p.xx.yc for p in region]
+        if max(ys) - min(ys) > 60:
+            continue
+        # 英文侧 token 全集: 待人工/不一致项的 en 检查点
+        en_tokens = []
+        for p in pend:
+            en_tokens.extend(TOKEN_RE.findall(p.en.text))
+        # 译文侧 token 全集: 待人工/不一致已配 xx + 多出 xx
+        xx_tokens = []
+        for p in region:
+            if p.xx is not None:
+                xx_tokens.extend(TOKEN_RE.findall(p.xx.text))
+        if not en_tokens or not xx_tokens:
+            continue
+        if _multiset_eq(en_tokens, xx_tokens):
+            main = sorted(pend, key=lambda p: p.en.yc)[0]
+            rest = [p for p in region if p is not main]
+            main.status = '疑聚合差异'
+            main.note = (f'疑聚合差异(区域拆分): 英文侧若干检查点数字与译文拆散项数值等效'
+                         f'(含 {len(pout)} 个多出项), 属拆分/聚合排版差异, 需人工确认排版影响; '
+                         f'已并入 {len(rest)} 条')
+            for p2 in rest:
+                p2.status = '已并入聚合差异'
+                p2.note = f'已并入同区域疑聚合差异(检查点 {main.cp}), 不再重复计为问题项'
+
+    # 方向五: 未匹配(英文多值聚合) + 多出(译文拆分项)成组, 因排版位移大未配成一对。
+    # 独立遍历(不与方向四耦合, 方向四的 continue 不影响)。
+    for ps in bypg.values():
+        um = [p for p in ps if p.status == '译文未匹配' and p.en is not None]
+        ex = [p for p in ps if p.status == '译文多出' and p.xx is not None]
+        for u in um:
+            utoks = TOKEN_RE.findall(u.en.text)
+            if len(utoks) < 2:
+                continue
+            cands = [o for o in ex if abs(o.xx.yc - u.en.yc) < 150]
+            if not cands:
+                continue
+            all_toks = []
+            for o in cands:
+                all_toks.extend(TOKEN_RE.findall(o.xx.text))
+            if len(cands) >= 2 and _multiset_eq(all_toks, utoks):
+                u.status = '疑聚合差异'
+                u.note = (f'疑聚合差异(拆分+位移): 英文检查点 {u.cp} "{u.en.text}" 为聚合值, '
+                          f'译文拆分为 {len(cands)} 项({" ".join(o.xx.text for o in cands)}), '
+                          f'因排版位移大而未匹配; 数字内容一致, 已合并供人工确认排版影响')
                 for o in cands:
-                    all_toks.extend(TOKEN_RE.findall(o.xx.text))
-                if len(cands) >= 2 and _multiset_eq(all_toks, utoks):
-                    u.status = '疑聚合差异'
-                    u.note = (f'疑聚合差异(拆分+位移): 英文检查点 {u.cp} "{u.en.text}" 为聚合值, '
-                              f'译文拆分为 {len(cands)} 项({" ".join(o.xx.text for o in cands)}), '
-                              f'因排版位移大而未匹配; 数字内容一致, 已合并供人工确认排版影响')
-                    for o in cands:
-                        o.status = '已并入聚合差异'
-                        o.note = f'已并入检查点 {u.cp}(疑聚合差异-拆分位移), 不再重复计为问题项'
+                    o.status = '已并入聚合差异'
+                    o.note = f'已并入检查点 {u.cp}(疑聚合差异-拆分位移), 不再重复计为问题项'
 
-        # 方向七: 排版换位确认。不一致项的英文/译文同区域(y±25pt)红字值集合数值等效
-        # -> 判一致(排版换位), 消除排版错位/换位误报。
-        # 安全: 集合不等(值真不同, 如 290 vs 29)不触发, 保留不一致供人工核对。
-        for ps in bypg.values():
-            mis = [p for p in ps if p.status == '不一致' and p.en is not None and p.xx is not None]
-            R = 25.0
-            for q in mis:
-                E = [t for p2 in ps if p2.en is not None and abs(p2.en.yc - q.en.yc) <= R
-                     for t in TOKEN_RE.findall(p2.en.text)]
-                X = [t for p2 in ps if p2.xx is not None and abs(p2.xx.yc - q.xx.yc) <= R
-                     for t in TOKEN_RE.findall(p2.xx.text)]
-                if not E or not X:
-                    continue
-                if _multiset_eq(E, X):
-                    q.status = '一致'
-                    q.note = f'排版换位确认: 同区域红字值集合数值等效, 判一致(排版换位); ' + q.note
+    # 方向七: 排版换位确认。不一致项的英文/译文同区域(y±25pt)红字值集合数值等效
+    # -> 判一致(排版换位), 消除排版错位/换位误报。
+    # 安全: 集合不等(值真不同, 如 290 vs 29)不触发, 保留不一致供人工核对。
+    for ps in bypg.values():
+        mis = [p for p in ps if p.status == '不一致' and p.en is not None and p.xx is not None]
+        R = 25.0
+        for q in mis:
+            E = [t for p2 in ps if p2.en is not None and abs(p2.en.yc - q.en.yc) <= R
+                 for t in TOKEN_RE.findall(p2.en.text)]
+            X = [t for p2 in ps if p2.xx is not None and abs(p2.xx.yc - q.xx.yc) <= R
+                 for t in TOKEN_RE.findall(p2.xx.text)]
+            if not E or not X:
+                continue
+            if _multiset_eq(E, X):
+                q.status = '一致'
     return pairs
 
 # ---------------- 截图 ----------------
@@ -760,12 +949,14 @@ def snap(doc: fitz.Document, pno: int, bbox, path: str):
 # ---------------- Excel 报告 ----------------
 FILL = {
     '不一致':   PatternFill('solid', fgColor='C00000'),
+    '需复核':   PatternFill('solid', fgColor='FFC000'),
     '格式差异': PatternFill('solid', fgColor='ED7D31'),
     '待人工':   PatternFill('solid', fgColor='FFC000'),
     '疑聚合差异': PatternFill('solid', fgColor='DAA520'),
     '译文未匹配': PatternFill('solid', fgColor='FFC000'),
     '译文多出':  PatternFill('solid', fgColor='FFC000'),
     '已并入聚合差异': PatternFill('solid', fgColor='BFBFBF'),
+    '非锚定区(忽略)': PatternFill('solid', fgColor='D9D9D9'),
     '一致':     PatternFill('solid', fgColor='70AD47'),
     'high':    PatternFill('solid', fgColor='70AD47'),
     'medium':  PatternFill('solid', fgColor='FFC000'),
@@ -793,10 +984,9 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
     ws = wb.active
     ws.title = '汇总'
     headers = ['文件名', '语言', '英文检查点数', '译文红字项', '一致', '其中大位移确认',
-               '不一致', '格式差异', '待人工', '疑聚合差异', '译文未匹配', '译文多出', '结论']
+               '不一致', '需复核', '结论']
     ws.append(headers)
-    tot = {k: 0 for k in ['一致', '不一致', '格式差异', '待人工', '疑聚合差异',
-                          '译文未匹配', '译文多出']}
+    tot = {k: 0 for k in ['一致', '不一致', '需复核']}
     tot_sp = 0
     for r in results:
         cnt = {k: 0 for k in tot}
@@ -806,23 +996,20 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         for k in tot:
             tot[k] += cnt[k]
         tot_sp += r['n_sp']
-        problems = cnt['不一致'] + cnt['格式差异'] + cnt['待人工'] + cnt['疑聚合差异'] \
-            + cnt['译文未匹配'] + cnt['译文多出']
+        problems = cnt['不一致'] + cnt['需复核']
         concl = '✓ 通过' if problems == 0 else f'⚠ 需人工({problems}项)'
         ws.append([r['file'], r['lang'], len(en_items), r['n_xx'],
-                   cnt['一致'], r['n_sp'], cnt['不一致'], cnt['格式差异'], cnt['待人工'],
-                   cnt['疑聚合差异'], cnt['译文未匹配'], cnt['译文多出'], concl])
+                   cnt['一致'], r['n_sp'], cnt['不一致'], cnt['需复核'], concl])
         if problems:
             for c in range(1, len(headers) + 1):
                 ws.cell(row=ws.max_row, column=c).fill = PatternFill('solid', fgColor='FFF2CC')
             ws.cell(row=ws.max_row, column=len(headers)).font = RED_FONT
     ws.append(['总计', '', len(en_items) * len(results), '', tot['一致'], tot_sp,
-               tot['不一致'], tot['格式差异'], tot['待人工'], tot['疑聚合差异'],
-               tot['译文未匹配'], tot['译文多出'], ''])
+               tot['不一致'], tot['需复核'], ''])
     for c in range(1, len(headers) + 1):
         ws.cell(row=ws.max_row, column=c).font = Font(bold=True)
     style_header(ws, len(headers))
-    for c, w in zip(range(1, len(headers) + 1), [34, 8, 13, 11, 7, 14, 9, 9, 8, 12, 12, 10, 15]):
+    for c, w in zip(range(1, len(headers) + 1), [34, 8, 13, 11, 7, 14, 9, 9, 12]):
         ws.column_dimensions[get_column_letter(c)].width = w
 
     # ---- Sheet2 明细 ----
@@ -834,7 +1021,7 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         for p in r['pairs']:
             en_v = p.en.text if p.en else ''
             xx_v = p.xx.text if p.xx else ''
-            has_snap = p.status != '一致' and p.status != '已并入聚合差异'
+            has_snap = p.status != '一致' and p.status not in IGNORED_STATUSES
             se = os.path.join('snaps', r['lang'], f"{p.cp or 'XX'}_{r['lang']}_EN.png") if p.en and has_snap else ''
             sx = os.path.join('snaps', r['lang'], f"{p.cp or 'XX'}_{r['lang']}_XX.png") if p.xx and has_snap else ''
             sx2 = os.path.join('snaps', r['lang'], f"{p.cp or 'XX'}_{r['lang']}_XX@期望位置.png") \
@@ -871,9 +1058,9 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
             else:
                 xx_only.append((r['lang'], p))
     def mark(p):
-        return {'一致': '✓', '不一致': '✗', '格式差异': 'F', '待人工': '?',
+        return {'一致': '✓', '不一致': '✗', '需复核': '?', '格式差异': 'F', '待人工': '?',
                 '疑聚合差异': '≈', '已并入聚合差异': '·',
-                '译文未匹配': '∅', '译文多出': '＋'}.get(p.status, '?')
+                '译文未匹配': '∅', '译文多出': '＋', '非锚定区(忽略)': '·'}.get(p.status, '?')
     for it in en_rows:
         idx = en_by_page[it.page].index(it) + 1
         cp = f'P{it.page + 1}-{idx}'
@@ -884,7 +1071,7 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         ws.append(row)
         for c in range(3, len(headers) + 1):
             v = ws.cell(row=ws.max_row, column=c).value
-            for st, m in [('不一致', '✗'), ('格式差异', 'F'), ('待人工', '?'),
+            for st, m in [('不一致', '✗'), ('需复核', '?'), ('格式差异', 'F'), ('待人工', '?'),
                           ('疑聚合差异', '≈'), ('译文未匹配', '∅')]:
                 if v == m:
                     ws.cell(row=ws.max_row, column=c).fill = FILL[st]
@@ -902,6 +1089,7 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         ('✓', '一致：匹配成功且归一化数值相等'),
         ('✗', '不一致：数值不同，必须处理'),
         ('F', '格式差异：数值相同但书写不同(如 2.5 vs 2,5)'),
+        ('?', '需复核：无法确认对应(串位/聚合疑点/跨页等), 保守转人工'),
         ('?', '待人工：匹配存在歧义或数字个数不同'),
         ('∅', '译文未匹配：英文有此检查点但译文未找到红字(疑漏标)'),
         ('≈', '疑聚合差异：译文将相邻检查点的数字聚为一体，已合并为单条'),
@@ -945,20 +1133,16 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         ['检查点编号', 'P{页码}-{页内序号}, 以英文指示稿为准, 全语言统一'],
         [''],
         ['状态定义'],
-        ['一致', '匹配置信度高/中, 归一化后数值完全相等且书写形式相同'],
-        ['大位移确认', '计入一致; 译文排版重排导致红字大幅移动, 由上下邻居插值+唯一候选+偏差达标三条件确认, 备注含判据'],
-        ['不一致', '匹配置信度高/中, 数值不同 (红色, 必须处理)'],
-        ['格式差异', '数值相同但书写不同, 如 2.5 vs 2,5 (橙色, 转人工确认); 纯空格分组差异(25 35 42 50)计入一致'],
-        ['待人工', '匹配存在歧义或数字个数不同 (黄色, 转人工)'],
-        ['疑聚合差异', '译文将相邻两个检查点的数字聚为一个红字项, 已自动合并为单条; 需确认排版是否影响数值 (暗金, 转人工)'],
-        ['已并入聚合差异', '原"译文未匹配"项因被合并, 不重复计为问题 (灰色, 供追溯)'],
-        ['译文未匹配', '英文有此检查点但译文未找到红字 (黄色, 疑漏标); 截图列为译文期望位置'],
-        ['译文多出', '译文有红字但英文无对应 (黄色, 疑多标)'],
+        ['一致', '能确认对应且数值等价(含大位移确认/指纹锁定/编号列对齐/点逗写法差异, 备注说明)'],
+        ['不一致', '确认对应但数值不同(真差异), 或值在对面完全不存在(真缺失/多余); 红色, 必须处理'],
+        ['需复核', '无法确认对应(可能串位/聚合/跨页位移), 保守转人工; 黄色, 建议核对'],
+        ['大位移确认', '计入一致; 译排版重排导致红字大幅移动, 由上下邻居插值+唯一候选+偏差达标确认, 备注含判据'],
+        ['已并入聚合差异', '聚合/锚定合并后的原项, 不重复计为问题 (灰色, 供追溯)'],
+        ['非锚定区(忽略)', '不在客户红框内, 非校对对象 (灰, 不统计)'],
         [''],
         ['自动判定底线'],
-        ['原则', '不确定不判一致; 自动判一致仅有两条路径: ①一级高/中置信+归一化值相等 ②大位移三判据全过'],
-        ['大位移三判据', '唯一值相同候选 + 双侧已配对邻居插值支撑 + 偏差≤阈值, 全部满足才自动判, 其余一律转人工'],
-        ['聚合差异四条件', '同页; 待人工项译文token数>英文token数; 多出token与未匹配邻项token完全一致; 位置邻近且未匹配邻项唯一; 全过才合并, 否则保持待人工'],
+        ['原则', '不确定不判一致; 自动判一致仅有: ①高/中置信+值相等 ②大位移三判据 ③指纹锁定(唯一) ④编号列对齐 ⑤点逗写法'  ],
+        ['大位移三判据', '唯一值相同候选 + 双侧已配对邻居插值支撑 + 偏差≤阈值, 全部满足才自动判, 其余一律转需复核'],
         [''],
         ['置信度'],
         ['high', '值相同且 y偏移与页偏移基准一致'],
@@ -1022,14 +1206,14 @@ section.lang>h2 .fname{color:#57606a;font-size:12px;font-weight:400}
 .allpass{padding:16px 20px;color:#1a7f37}
 .item{border-left:4px solid #d0d7de;padding:14px 20px;border-bottom:1px solid #eee}
 .item:last-child{border-bottom:none}
-.item.st-不一致{border-left-color:#cf222e}.item.st-格式差异{border-left-color:#fb8500}
+.item.st-不一致{border-left-color:#cf222e}.item.st-需复核{border-left-color:#e3b341}.item.st-格式差异{border-left-color:#fb8500}
 .item.st-待人工,.item.st-译文未匹配,.item.st-译文多出{border-left-color:#e3b341}
 .item.st-疑聚合差异{border-left-color:#b8860b}
 .item.st-大位移{border-left-color:#0969da}
 .item .head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-bottom:10px}
 .item .cp{font-weight:600;font-size:13px}
 .badge{display:inline-block;font-size:12px;padding:2px 10px;border-radius:10px;color:#fff}
-.b-不一致{background:#cf222e}.b-格式差异{background:#fb8500}.b-待人工,.b-译文未匹配,.b-译文多出{background:#bf8700}.b-大位移{background:#0969da}.b-一致{background:#1a7f37}.b-疑聚合差异{background:#b8860b}
+.b-不一致{background:#cf222e}.b-需复核{background:#e3b341}.b-格式差异{background:#fb8500}.b-待人工,.b-译文未匹配,.b-译文多出{background:#bf8700}.b-大位移{background:#0969da}.b-一致{background:#1a7f37}.b-疑聚合差异{background:#b8860b}
 .compare{display:flex;gap:14px;align-items:stretch;flex-wrap:wrap}
 figure{background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:8px;text-align:center}
 figure img{max-width:330px;max-height:180px;display:block}
@@ -1055,13 +1239,12 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
     import html as _h
     from datetime import datetime
 
-    status_key = {'不一致': '不一致', '格式差异': '格式差异', '待人工': '待人工',
-                  '译文未匹配': '译文未匹配', '译文多出': '译文多出', '疑聚合差异': '疑聚合差异'}
+    status_key = {'不一致': '不一致', '需复核': '需复核'}
     cnt = Counter()
     n_sp = 0
     for r in results:
         for p in r['pairs']:
-            if p.status == '已并入聚合差异':
+            if p.status in IGNORED_STATUSES:
                 continue                 # 合并项不重复计数
             if p.status in status_key:
                 cnt[p.status] += 1
@@ -1085,7 +1268,7 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
             cap = f'{LANG_NAMES.get(lang, lang)} · 期望位置(未找到红字)'
         img = _b64(f)
         # 需人工确认项可点击打开复核 PDF 定位
-        need_review = p.status not in ('一致', '已并入聚合差异')
+        need_review = p.status not in ('一致',) + IGNORED_STATUSES
         if need_review:
             if kind == 'EN' and p.en is not None:
                 href = f'复核PDF/EN.pdf#page={p.en.page + 1}'   # 英文截图 -> 英文指示稿复核版
@@ -1122,8 +1305,8 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
     ]
 
     # 筛选按钮
-    btns = [('all', '全部', n_sp + sum(cnt.values()))]
-    for st in ['不一致', '译文未匹配', '待人工', '疑聚合差异', '格式差异', '译文多出']:
+    btns = [('all', '全部', sum(cnt.values()))]
+    for st in ['不一致', '需复核']:
         if cnt[st]:
             btns.append((st, st, cnt[st]))
     if n_sp:
@@ -1138,7 +1321,7 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
     for r in results:
         lang = r['lang']
         lname = LANG_NAMES.get(lang, lang)
-        probs = [p for p in r['pairs'] if p.status != '一致' and p.status != '已并入聚合差异']
+        probs = [p for p in r['pairs'] if p.status != '一致' and p.status not in IGNORED_STATUSES]
         sps = [p for p in r['pairs'] if p.status == '一致' and '大位移' in p.note]
         problems = len(probs)
         concl = '✓ 通过' if problems == 0 else f'⚠ 需人工({problems}项)'
@@ -1196,6 +1379,256 @@ function setFilter(f){
 """
 
 
+# ---------------- 锚定与编号列 ----------------
+def detect_entry_columns(items: list, x_tol: float = 15.0, min_n: int = 3) -> list:
+    """识别页内科标号列(目录/列表编号): 单数字 1-20、右上下文以 '.'或')'开头、
+    x 同列(±x_tol)、按 y 递增、至少 min_n 个。
+    返回 [(x, [(yc, num, Item)...]), ...] 的编号列列表(按 x 一列一列)。"""
+    cands = []
+    for it in items:
+        t = it.text.strip()
+        if re.fullmatch(r'\d{1,2}', t) and 1 <= int(t) <= 20:
+            rc = it.right_ctx.strip()
+            if rc.startswith('.') or rc.startswith(')'):
+                cands.append((it.xc, it.yc, int(t), it))
+    # 按 x 列分组
+    cols = {}
+    for xc, yc, num, it in cands:
+        key = None
+        for k in cols:
+            if abs(k - xc) <= x_tol:
+                key = k
+                break
+        if key is None:
+            key = xc
+            cols[key] = []
+        cols[key].append((yc, num, it))
+    out = []
+    for xc, group in cols.items():
+        group.sort(key=lambda t: t[0])
+        if len(group) >= min_n:
+            out.append((xc, group))
+    return out
+
+
+def align_entry_columns_pairs(pairs: list, en_items: list, xx_items: list) -> int:
+    """编号列对齐: 对每页, 英文编号列与译文编号列按编号值对齐(1↔1, 2↔2...),
+    值相同的编号对 -> 该 pair 若未判一致则改判'一致(编号列对齐)'。
+    返回修改数。"""
+    changed = 0
+    en_by_page = {}
+    for it in en_items:
+        en_by_page.setdefault(it.page, []).append(it)
+    xx_by_page = {}
+    for it in xx_items:
+        xx_by_page.setdefault(it.page, []).append(it)
+    # en 检查点 -> pair 映射(按对象id)
+    en_pair = {id(p.en): p for p in pairs if p.en is not None}
+    for pno in set(en_by_page) & set(xx_by_page):
+        en_cols = detect_entry_columns(en_by_page[pno])
+        xx_cols = detect_entry_columns(xx_by_page[pno])
+        if not en_cols or not xx_cols:
+            continue
+        # 每列两两? 只取第一列(x 最小的编号列, 目录/列表通常在左侧)
+        ex, eg = min(en_cols, key=lambda c: c[0])
+        xx, xg = min(xx_cols, key=lambda c: c[0])
+        en_nums = {n: it for _, n, it in eg}
+        xx_nums = {n: it for _, n, it in xg}
+        for n in sorted(set(en_nums) & set(xx_nums)):
+            e_it, x_it = en_nums[n], xx_nums[n]
+            p = en_pair.get(id(e_it))
+            if p is None or p.xx is None:
+                continue
+            if p.status != '一致' and p.status not in IGNORED_STATUSES:
+                p.status = '一致'
+                p.note = ('编号列对齐: 编号 %d(%s) ↔ 译文编号 %d(%s), 排版位移已按序对齐; '
+                          % (n, e_it.text, n, x_it.text)) + p.note
+                changed += 1
+    return changed
+
+
+def detect_entry_columns_spans(doc: fitz.Document, pno: int) -> list:
+    """span 级编号列识别: 同行首编号('1.'/'7)') x同列, 按 y 递增, 至少3个。
+    返回 [(x, [(yc, num, span_bbox_x0)...])]"""
+    page = doc[pno]
+    d = page.get_text("dict")
+    cands = []
+    for blk in d.get("blocks", []):
+        if blk.get("type") != 0:
+            continue
+        for line in blk.get("lines", []):
+            spans = sorted(line.get("spans", []), key=lambda s: s["bbox"][0])
+            text = "".join(sp["text"] for sp in spans)
+            m = re.match(r'^\s*(\d{1,2})\s*[.)]', text)
+            if not m:
+                continue
+            n = int(m.group(1))
+            sp0 = spans[0] if spans else None
+            if sp0 is None:
+                continue
+            yc = (sp0["bbox"][1] + sp0["bbox"][3]) / 2
+            xc = sp0["bbox"][0]
+            near = [sp for sp in spans if sp["bbox"][0] < xc + 4 and sp["text"].strip() == m.group(1)]
+            if near:
+                xc = near[0]["bbox"][0]
+                yc = (near[0]["bbox"][1] + near[0]["bbox"][3]) / 2
+            if 1 <= n <= 20:
+                cands.append((xc, yc, n))
+    # 按 x 列
+    cols = {}
+    for xc, yc, n in cands:
+        key = None
+        for k in cols:
+            if abs(k - xc) <= 15:
+                key = k
+                break
+        if key is None:
+            key = xc
+            cols[key] = []
+        cols[key].append((yc, n))
+    out = []
+    for xc, grp in cols.items():
+        grp.sort(key=lambda t: t[0])
+        if len(grp) >= 3:
+            out.append((xc, grp))
+    return out
+
+
+def align_entry_columns_spans(pairs: list, en_doc: fitz.Document, xx_doc: fitz.Document) -> int:
+    """span级编号列对齐: 对每页, 英文编号列(编号值)与译文编号列按值对齐,
+    值相同则把'不一致/待人工'且 y 在编号±8 内的检查点改判'一致(编号列对齐)'。"""
+    changed = 0
+    maxp = max(en_doc.page_count, xx_doc.page_count)
+    for pno in range(maxp):
+        en_cols = detect_entry_columns_spans(en_doc, pno)
+        xx_cols = detect_entry_columns_spans(xx_doc, pno)
+        if not en_cols or not xx_cols:
+            continue
+        ex, eg = min(en_cols, key=lambda c: c[0])
+        xx, xg = min(xx_cols, key=lambda c: c[0])
+        en_nums = {n: y for y, n in eg}
+        xx_nums = {n: y for y, n in xg}
+        for n in sorted(set(en_nums) & set(xx_nums)):
+            ey, xy = en_nums[n], xx_nums[n]
+            for p in pairs:
+                if p.en is None or p.xx is None:
+                    continue
+                if p.status not in ('不一致', '待人工'):
+                    continue
+                if p.en.page == pno and abs(p.en.yc - ey) <= 8 and p.xx.page == pno and abs(p.xx.yc - xy) <= 8:
+                    p.status = '一致'
+                    p.note = f'编号列对齐: 编号 {n} ({p.en.text}) ↔ 译文编号 {n} ({p.xx.text}), 排版位移已按序对齐'
+                    changed += 1
+    return changed
+
+
+def attach_fp(items: list, doc: fitz.Document) -> None:
+    """后处理: 为每个检查点补语义指纹(单位/型号/符号), 使用检查点所在行全文 + 页面上方表头。
+    页面级: 表格单位常在表头(上方行), 因此指纹优先: 检查点行全文 -> 上方最近含单位的行。"""
+    # 页级文本(按行): page -> [(yc, full_text)]
+    page_lines = {}
+    for pno in range(doc.page_count):
+        rows = []
+        for blk in doc[pno].get_text("dict").get("blocks", []):
+            if blk.get("type") != 0:
+                continue
+            for line in blk.get("lines", []):
+                ly = (line["bbox"][1] + line["bbox"][3]) / 2
+                txt = "".join(sp["text"] for sp in line.get("spans", []))
+                if txt.strip():
+                    rows.append((ly, txt))
+        rows.sort(key=lambda r: r[0])
+        page_lines[pno] = rows
+    for it in items:
+        if it.fp:
+            continue
+        rows = page_lines.get(it.page, [])
+        # 本行全文
+        line_full = ''
+        header_full = ''
+        for ly, txt in rows:
+            if abs(ly - it.yc) <= LINE_TOL + 4:
+                line_full = txt
+                break
+        # 上方最近行(表头, y 小且在同一页顶部区域, 容差 60pt)
+        for ly, txt in reversed(rows):
+            if ly < it.yc - 8 and it.yc - ly < 60:
+                header_full = txt
+                break
+        it.fp = extract_fp(it.text, it.left_ctx, it.right_ctx, line_full, header_full)
+    return items
+
+
+def finalize_statuses(pairs: list, en_items: list, xx_items: list) -> int:
+    """报告前状态归一化(保守):
+      一致     : 配对上且值相同(含大位移/指纹/编号列/点逗写法, 备注保留)
+      不一致   : 真差异/真缺失(对面无剩余候选值)
+      需复核   : 无法确认(对面有未配对候选, 疑串位)
+    """
+    changed = 0
+    # 已配对集合
+    paired_xx = {id(p.xx) for p in pairs if p.xx is not None}
+    paired_en = {id(p.en) for p in pairs if p.en is not None}
+    for p in pairs:
+        if p.status in IGNORED_STATUSES or p.status == '一致':
+            continue
+        if p.status == '不一致':
+            continue
+        if p.en is not None:
+            vals = TOKEN_RE.findall(p.en.text)
+            if p.xx is not None:
+                p.status = '需复核'
+                p.note = '需复核(有对应但无法确认): ' + p.note
+                changed += 1
+                continue
+            # 译文未匹配: 期望位置(expect_y)±35pt 内, 同指纹同值的候选存在?
+            # 存在 -> 串位(需复核); 不存在 -> 真缺失(不一致)
+            def near_exists():
+                if p.expect_y is None or not vals:
+                    return _count_unpaired(xx_items, vals, p.en.page, p.en.fp, paired_xx) > 0
+                for it in xx_items:
+                    if it.page != p.en.page or abs(it.yc - p.expect_y) > 20:
+                        continue
+                    if p.en.fp and it.fp and it.fp != p.en.fp:
+                        continue
+                    itoks = TOKEN_RE.findall(it.text)
+                    if any(any(_num_eq(v, t) for t in itoks) for v in vals):
+                        return True
+                return False
+            if near_exists():
+                p.status = '需复核'
+                p.note = '需复核(值存在但未配到,疑串位): ' + p.note
+            else:
+                p.status = '不一致'
+                p.note = '真缺失(期望位置无对应值): ' + p.note
+            changed += 1
+        else:
+            vals = TOKEN_RE.findall(p.xx.text)
+            has_remain = _count_unpaired(en_items, vals, p.xx.page, p.xx.fp, paired_en)
+            if has_remain:
+                p.status = '需复核'
+                p.note = '需复核(值存在但未配到,疑串位): ' + p.note
+            else:
+                p.status = '不一致'
+                p.note = '真多余(值在英文不存在或候选已用): ' + p.note
+            changed += 1
+    return changed
+
+
+def _count_unpaired(items: list, vals: list, pno: int, fp: str, paired_ids: set) -> int:
+    """同页同指纹同值、且未被配对的剩余候选数量。"""
+    n = 0
+    for it in items:
+        if it.page != pno or id(it) in paired_ids:
+            continue
+        if fp and it.fp and it.fp != fp:
+            continue
+        itoks = TOKEN_RE.findall(it.text)
+        if vals and any(any(_num_eq(v, t) for t in itoks) for v in vals):
+            n += 1
+    return n
+
+
 # ---------------- 复核 PDF ----------------
 def _snap_tag(p: Pair) -> str:
     """截图/标注文件名: 多出项无检查点编号, 用页+y坐标唯一化, 避免互相覆盖"""
@@ -1224,7 +1657,6 @@ def build_review_pdf(src_pdf: str, out_path: str, marks: list):
         ha.update()
         # 悬停才显示的说明气泡, 不占版面
         ta = page.add_text_annot(r, label, icon='note')
-        ta.update()
         ta.update()
     doc.save(out_path, garbage=3, deflate=True)
     doc.close()
@@ -1263,8 +1695,9 @@ def lang_code(fname: str) -> str:
 
 
 def main():
-    ap = argparse.ArgumentParser(description='多国语数字校对工具 (P0)')
-    ap.add_argument('--base', required=True, help='英文指示稿 PDF')
+    ap = argparse.ArgumentParser(description='多国语数字校对工具 (锚定模式) [P0]')
+    ap.add_argument('--base', required=True, help='英文红字指示稿(全标红版) PDF')
+    ap.add_argument('--anchor', default=None, help='可选: 客户高光指示原稿(红框+青色高亮), 提供则启用锚定模式')
     ap.add_argument('--dir', required=True, help='多国语 PDF 文件夹')
     ap.add_argument('--out', default=None, help='输出目录 (默认: <dir>/_校对结果)')
     args = ap.parse_args()
@@ -1276,15 +1709,25 @@ def main():
     print(f'英文指示稿: {args.base}')
     en_color_counter = Counter()
     en_doc = fitz.open(args.base)
+    anchor_zones = None
+    if args.anchor:
+        anchor_doc = fitz.open(args.anchor)
+        anchor_zones = anchor_zone_rects(anchor_doc)
+        print(f'锚定模式: {args.anchor} (红框区域, 框内数字为校对对象)')
     en_items = extract_items(en_doc, en_color_counter)
-    print(f'英文检查点数: {len(en_items)}')
+    attach_fp(en_items, en_doc)
+    if args.anchor:
+        n_in = sum(1 for it in en_items if in_anchor(it, anchor_zones))
+        print(f'英文检查点(全量)={len(en_items)} 框内(锚定)={n_in}')
+    else:
+        print(f'英文检查点数: {len(en_items)}')
     en_sorted = sorted(en_items, key=lambda i: (i.page, i.yc, i.bbox[0]))
-    en_cp = {}
-    for k, it in enumerate(en_sorted, 1):
-        en_cp[(it.page, round(it.yc, 1))] = f'P{it.page + 1}-{k}'
 
     files = [f for f in os.listdir(args.dir)
-             if f.lower().endswith('.pdf') and os.path.abspath(os.path.join(args.dir, f)) != os.path.abspath(args.base)]
+             if f.lower().endswith('.pdf') and os.path.abspath(os.path.join(args.dir, f)) != os.path.abspath(args.base)
+             and (not args.anchor or os.path.abspath(os.path.join(args.dir, f)) != os.path.abspath(args.anchor))
+             and not re.search(r'0\dEn|_01En\b', f, re.I)
+             and not ('英文' in f and '校对' not in f) and not f.startswith('英文')]
     files.sort()
     print(f'待校对文件: {len(files)} 个')
 
@@ -1301,13 +1744,37 @@ def main():
         doc = fitz.open(path)
         cc = Counter()
         xx_items = extract_items(doc, cc)
+        attach_fp(xx_items, doc)
         pairs = build_pairs(en_items, xx_items, en_doc.page_count, doc.page_count)
         # 回填检查点编号(匹配页内的编号)
         for p in pairs:
             if p.en is not None:
                 lst = en_sorted_page[p.en.page]
                 p.cp = f'P{p.en.page + 1}-{lst.index(p.en) + 1}'
+        if anchor_zones:
+            # 锚定模式: 英文检查点不在红框内 -> 非锚定区(忽略, 不入选统计/截图/报告)
+            for p in pairs:
+                if p.en is not None and not in_anchor(p.en, anchor_zones):
+                    p.status = '非锚定区(忽略)'
+                    p.note = '非锚定区: 英文检查点不在客户红框内'
+            # 译文孤儿(多出/未匹配): 其译文项不在任何红框内(x+y 全判) -> 非锚定区, 忽略
+            for p in pairs:
+                if p.status in ('译文多出', '译文未匹配'):
+                    reffx = p.xx if p.xx is not None else p.en
+                    if reffx is not None and reffx.page < len(anchor_zones):
+                        bb = fitz.Rect(reffx.bbox)
+                        inbox = any(bb.intersects(z) or (z.x0 - 10 <= reffx.xc <= z.x1 + 10
+                                                          and z.y0 - 8 <= reffx.yc <= z.y1 + 8)
+                                    for z in anchor_zones[reffx.page])
+                        if not inbox:
+                            p.status = '非锚定区(忽略)'
+                            p.note = '非锚定区: 译文项不在客户红框范围内'
         resolve_aggregation(pairs)
+        if anchor_zones:
+            # 编号列对齐(span级): 目录/列表编号按序对齐, 消除排版位移误报
+            align_entry_columns_pairs(pairs, en_items, xx_items)
+            align_entry_columns_spans(pairs, en_doc, doc)
+        finalize_statuses(pairs, en_items, xx_items)
         # 非标准红提示: 文件中出现了英文稿没有的红系颜色
         en_main = {c for c, _ in en_color_counter.most_common(3)}
         odd = {c: n for c, n in cc.items() if c not in en_main}
@@ -1334,7 +1801,7 @@ def main():
             # 一致且非大位移确认 -> 无需截图; 大位移确认(位移大)同样配截图供人工核对; 已并入项不再单独截图
             if p.status == '一致' and '大位移' not in p.note:
                 continue
-            if p.status == '已并入聚合差异':
+            if p.status in IGNORED_STATUSES:
                 continue
             os.makedirs(lang_snap, exist_ok=True)
             tag = _snap_tag(p)
@@ -1358,13 +1825,13 @@ def main():
                     page.get_pixmap(clip=r2, dpi=SNAP_DPI).save(
                         os.path.join(lang_snap, f'{tag}_{lang}_XX@期望位置.png'))
                     n_snaps += 1
-        problems = sum(1 for p in pairs if p.status != '一致' and p.status != '已并入聚合差异')
+        problems = sum(1 for p in pairs if p.status != '一致' and p.status not in IGNORED_STATUSES)
         n_sp = sum(1 for p in pairs if p.status == '一致' and '大位移' in p.note)
         r['n_sp'] = n_sp
         # 复核 PDF: 仅需人工确认的问题项(大位移/排版差异已自动判一致, 不需生成)
         marks = []
         for p in pairs:
-            if p.status in ('一致', '已并入聚合差异'):
+            if p.status in ('一致',) + IGNORED_STATUSES:
                 continue
             if p.xx is not None:
                 marks.append((p.xx.page, p.xx.bbox, f'{p.cp or "?"} CHECK', False))
@@ -1382,7 +1849,7 @@ def main():
             build_review_pdf(path, os.path.join(review_dir, f'{lang}.pdf'), marks)
         # 收集英文侧标注(同一检查点多语言问题叠加)
         for p in pairs:
-            if p.status in ('一致', '已并入聚合差异') or p.en is None:
+            if p.status in ('一致',) + IGNORED_STATUSES or p.en is None:
                 continue
             key = (p.en.page, round(p.en.yc, 1), round(p.en.bbox[0], 1))
             en_marks.setdefault(key, {'bbox': p.en.bbox, 'langs': set()})
