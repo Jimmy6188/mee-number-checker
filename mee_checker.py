@@ -22,9 +22,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from statistics import median
 
-import numpy as np
 import fitz  # PyMuPDF
-from scipy.optimize import linear_sum_assignment
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -582,7 +580,7 @@ def match_page(en_items: list[Item], xx_items: list[Item], page1: int) -> list[P
     free_xx = [j for j in range(m) if j not in locked_xx]
     if free_en and free_xx:
         fe, fx = len(free_en), len(free_xx)
-        cost_f = np.full((fe, fx), COST_BIG)
+        cost_f = [[COST_BIG] * fx for _ in range(fe)]
         for a, i in enumerate(free_en):
             for b, j in enumerate(free_xx):
                 e, x = en_items[i], xx_items[j]
@@ -600,10 +598,10 @@ def match_page(en_items: list[Item], xx_items: list[Item], page1: int) -> list[P
                     c -= REWARD_CTX
                 if e.right_ctx and x.right_ctx and e.right_ctx.lower() == x.right_ctx.lower():
                     c -= REWARD_CTX
-                cost_f[a, b] = c
-        ri, cj = linear_sum_assignment(cost_f)
+                cost_f[a][b] = c
+        ri, cj = _hungarian(cost_f)
         for a, b in zip(ri, cj):
-            if cost_f[a, b] >= REJECT_COST or cost_f[a, b] >= COST_BIG:
+            if cost_f[a][b] >= REJECT_COST or cost_f[a][b] >= COST_BIG:
                 continue
             i, j = free_en[a], free_xx[b]
             e, x = en_items[i], xx_items[j]
@@ -1755,42 +1753,35 @@ def lang_code(fname: str) -> str:
     return os.path.splitext(fname)[0]
 
 
-def main():
-    ap = argparse.ArgumentParser(description='多国语数字校对工具 (锚定模式) [P0]')
-    ap.add_argument('--base', required=True, help='英文红字指示稿(全标红版) PDF')
-    ap.add_argument('--anchor', default=None, help='可选: 客户高光指示原稿(红框+青色高亮), 提供则启用锚定模式')
-    ap.add_argument('--dir', required=True, help='多国语 PDF 文件夹')
-    ap.add_argument('--out', default=None, help='输出目录 (默认: <dir>/_校对结果)')
-    args = ap.parse_args()
-
-    out_dir = args.out or os.path.join(args.dir, '_校对结果')
+def run_job(base, anchor, data_dir, out=None, log=print):
+    out_dir = out or os.path.join(data_dir, '_校对结果')
     snaps_dir = os.path.join(out_dir, 'snaps')
     os.makedirs(snaps_dir, exist_ok=True)
 
-    print(f'英文指示稿: {args.base}')
+    log(f'英文指示稿: {base}')
     en_color_counter = Counter()
-    en_doc = fitz.open(args.base)
+    en_doc = fitz.open(base)
     anchor_zones = None
-    if args.anchor:
-        anchor_doc = fitz.open(args.anchor)
+    if anchor:
+        anchor_doc = fitz.open(anchor)
         anchor_zones = anchor_zone_rects(anchor_doc)
-        print(f'锚定模式: {args.anchor} (红框区域, 框内数字为校对对象)')
+        log(f'锚定模式: {anchor} (红框区域, 框内数字为校对对象)')
     en_items = extract_items(en_doc, en_color_counter)
     attach_fp(en_items, en_doc)
-    if args.anchor:
+    if anchor:
         n_in = sum(1 for it in en_items if in_anchor(it, anchor_zones))
-        print(f'英文检查点(全量)={len(en_items)} 框内(锚定)={n_in}')
+        log(f'英文检查点(全量)={len(en_items)} 框内(锚定)={n_in}')
     else:
-        print(f'英文检查点数: {len(en_items)}')
+        log(f'英文检查点数: {len(en_items)}')
     en_sorted = sorted(en_items, key=lambda i: (i.page, i.yc, i.bbox[0]))
 
-    files = [f for f in os.listdir(args.dir)
-             if f.lower().endswith('.pdf') and os.path.abspath(os.path.join(args.dir, f)) != os.path.abspath(args.base)
-             and (not args.anchor or os.path.abspath(os.path.join(args.dir, f)) != os.path.abspath(args.anchor))
+    files = [f for f in os.listdir(data_dir)
+             if f.lower().endswith('.pdf') and os.path.abspath(os.path.join(data_dir, f)) != os.path.abspath(base)
+             and (not anchor or os.path.abspath(os.path.join(data_dir, f)) != os.path.abspath(anchor))
              and not re.search(r'0\dEn|_01En\b', f, re.I)
              and not ('英文' in f and '校对' not in f) and not f.startswith('英文')]
     files.sort()
-    print(f'待校对文件: {len(files)} 个')
+    log(f'待校对文件: {len(files)} 个')
 
     results = []
     color_notes = []   # 非标准红提示
@@ -1800,7 +1791,7 @@ def main():
     for it in en_sorted:
         en_sorted_page.setdefault(it.page, []).append(it)
     for fname in files:
-        path = os.path.join(args.dir, fname)
+        path = os.path.join(data_dir, fname)
         lang = lang_code(fname)
         doc = fitz.open(path)
         cc = Counter()
@@ -1847,7 +1838,7 @@ def main():
     # 跨语言交叉验证聚合差异(在截图/统计前, 影响最终状态)
     n_cross = cross_validate_aggregation(results)
     if n_cross:
-        print(f'跨语言交叉验证: {n_cross} 项聚合差异自动判为一致(排版差异)')
+        log(f'跨语言交叉验证: {n_cross} 项聚合差异自动判为一致(排版差异)')
 
     # 统一截图/复核 PDF/统计
     for r in results:
@@ -1915,7 +1906,7 @@ def main():
             key = (p.en.page, round(p.en.yc, 1), round(p.en.bbox[0], 1))
             en_marks.setdefault(key, {'bbox': p.en.bbox, 'langs': set()})
             en_marks[key]['langs'].add(lang)
-        print(f'  [{lang}] {fname}: 检查点{len(en_items)} 译文红字{r["n_xx"]} '
+        log(f'  [{lang}] {fname}: 检查点{len(en_items)} 译文红字{r["n_xx"]} '
               f'问题项{problems} 低风险{n_sp} (截图{n_snaps}张 复核PDF{len(marks)}框)')
         doc.close()
 
@@ -1927,15 +1918,106 @@ def main():
         en_rows.append([page0, info['bbox'], f'CHECK ({langs})', True])
     if en_rows:
         os.makedirs(review_dir, exist_ok=True)
-        build_review_pdf(args.base, os.path.join(review_dir, 'EN.pdf'), en_rows)
+        build_review_pdf(base, os.path.join(review_dir, 'EN.pdf'), en_rows)
 
     report = os.path.join(out_dir, '数字校对报告.xlsx')
-    build_excel(report, os.path.basename(args.base), en_items, results, snaps_dir, color_notes)
+    build_excel(report, os.path.basename(base), en_items, results, snaps_dir, color_notes)
     report_html = os.path.join(out_dir, '数字校对报告.html')
-    build_html(report_html, os.path.basename(args.base), en_items, results, snaps_dir)
-    print(f'\n报告已生成: {report}')
-    print(f'           {report_html}')
-    print(f'截图目录:   {snaps_dir}')
+    build_html(report_html, os.path.basename(base), en_items, results, snaps_dir)
+    log(f'\n报告已生成: {report}')
+    log(f'           {report_html}')
+    log(f'截图目录:   {snaps_dir}')
+    return report, report_html, snaps_dir, out_dir
+
+
+def _hungarian(g):
+    """最小成本二分配对(匈牙利算法 Kuhn-Munkres, 纯 Python), 返回 (ri, cj).
+    g: list[list[float]] 成本矩阵 (n 行 x m 列). 按 e-maxx 标准写法.
+    """
+    n, m = len(g), len(g[0]) if g else 0
+    if not n or not m:
+        return [], []
+    BIG = max(max(row) for row in g) + 1e12
+    if n > m:
+        ri, cj = _hungarian([list(row) for row in zip(*g)])
+        return list(cj), list(ri)
+    u = [0.0] * (n + 1)
+    v = [0.0] * (m + 1)
+    p = [0] * (m + 1)
+    way = [0] * (m + 1)
+    for i0 in range(1, n + 1):
+        p[0] = i0
+        j0 = 0
+        minv = [BIG] * (m + 1)
+        used = [False] * (m + 1)
+        while True:
+            used[j0] = True
+            i0_ = p[j0]
+            delta = BIG
+            j1 = 0
+            for j in range(1, m + 1):
+                if used[j]:
+                    continue
+                cur = g[i0_ - 1][j - 1] - u[i0_] - v[j]
+                if cur < minv[j]:
+                    minv[j] = cur
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+            for j in range(m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+    ri, cj = [], []
+    for j in range(1, m + 1):
+        if p[j]:
+            ri.append(p[j] - 1)
+            cj.append(j - 1)
+    return list(ri), list(cj)
+
+
+def _hungarian_test():
+    """对拍验证: 与穷举最优解比较 (小规模随机矩阵)."""
+    import random
+    from itertools import permutations
+    for _ in range(300):
+        n = random.randint(1, 7)
+        m = random.randint(1, 7)
+        g = [[random.randint(0, 20) for _ in range(m)] for _ in range(n)]
+        ri, cj = _hungarian(g)
+        assert len(ri) == len(cj), (n, m)
+        assert len(set(ri)) == len(ri)
+        assert len(set(cj)) == len(cj)
+        if n <= m:
+            best = min(sum(g[i][perm[i]] for i in range(n)) for perm in permutations(range(m), n))
+            total = sum(g[i][cj[ri.index(i)]] for i in range(n))
+        else:
+            best = min(sum(g[perm[j]][j] for j in range(m)) for perm in permutations(range(n), m))
+            total = sum(g[ri[i]][cj[i]] for i in range(len(ri)))
+        assert abs(total - best) < 1e-9, (n, m, total, best)
+    print('_hungarian 对拍验证通过 (300 组随机矩阵)')
+
+
+def main():
+    ap = argparse.ArgumentParser(description='多国语数字校对工具 (锚定模式) [P0]')
+    ap.add_argument('--base', required=True, help='英文红字指示稿(全标红版) PDF')
+    ap.add_argument('--anchor', default=None, help='可选: 客户高光指示原稿(红框+青色高亮), 提供则启用锚定模式')
+    ap.add_argument('--dir', required=True, help='多国语 PDF 文件夹')
+    ap.add_argument('--out', default=None, help='输出目录 (默认: <dir>/_校对结果)')
+    args = ap.parse_args()
+    run_job(args.base, args.anchor, args.dir, args.out)
 
 
 if __name__ == '__main__':
