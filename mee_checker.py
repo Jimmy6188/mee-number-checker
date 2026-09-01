@@ -948,6 +948,9 @@ def snap(doc: fitz.Document, pno: int, bbox, path: str):
 
 # ---------------- Excel 报告 ----------------
 FILL = {
+    '高风险':   PatternFill('solid', fgColor='C00000'),
+    '中风险':   PatternFill('solid', fgColor='FFC000'),
+    '低风险':   PatternFill('solid', fgColor='4A90D9'),
     '不一致':   PatternFill('solid', fgColor='C00000'),
     '需复核':   PatternFill('solid', fgColor='FFC000'),
     '格式差异': PatternFill('solid', fgColor='ED7D31'),
@@ -983,10 +986,10 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
     # ---- Sheet1 汇总 ----
     ws = wb.active
     ws.title = '汇总'
-    headers = ['文件名', '语言', '英文检查点数', '译文红字项', '一致', '其中大位移确认',
-               '不一致', '需复核', '结论']
+    headers = ['文件名', '语言', '英文检查点数', '译文红字项', '一致(通过)',
+               '低风险(大位移确认)', '中风险(需复核)', '高风险(不一致)', '结论']
     ws.append(headers)
-    tot = {k: 0 for k in ['一致', '不一致', '需复核']}
+    tot = {k: 0 for k in ['一致', '低风险', '中风险', '高风险']}
     tot_sp = 0
     for r in results:
         cnt = {k: 0 for k in tot}
@@ -996,20 +999,20 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         for k in tot:
             tot[k] += cnt[k]
         tot_sp += r['n_sp']
-        problems = cnt['不一致'] + cnt['需复核']
+        problems = cnt['高风险'] + cnt['中风险']
         concl = '✓ 通过' if problems == 0 else f'⚠ 需人工({problems}项)'
         ws.append([r['file'], r['lang'], len(en_items), r['n_xx'],
-                   cnt['一致'], r['n_sp'], cnt['不一致'], cnt['需复核'], concl])
+                   cnt['一致'], r['n_sp'], cnt['中风险'], cnt['高风险'], concl])
         if problems:
             for c in range(1, len(headers) + 1):
                 ws.cell(row=ws.max_row, column=c).fill = PatternFill('solid', fgColor='FFF2CC')
             ws.cell(row=ws.max_row, column=len(headers)).font = RED_FONT
     ws.append(['总计', '', len(en_items) * len(results), '', tot['一致'], tot_sp,
-               tot['不一致'], tot['需复核'], ''])
+               tot['中风险'], tot['高风险'], ''])
     for c in range(1, len(headers) + 1):
         ws.cell(row=ws.max_row, column=c).font = Font(bold=True)
     style_header(ws, len(headers))
-    for c, w in zip(range(1, len(headers) + 1), [34, 8, 13, 11, 7, 14, 9, 9, 12]):
+    for c, w in zip(range(1, len(headers) + 1), [34, 8, 13, 11, 10, 14, 14, 14, 12]):
         ws.column_dimensions[get_column_letter(c)].width = w
 
     # ---- Sheet2 明细 ----
@@ -1058,7 +1061,7 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
             else:
                 xx_only.append((r['lang'], p))
     def mark(p):
-        return {'一致': '✓', '不一致': '✗', '需复核': '?', '格式差异': 'F', '待人工': '?',
+        return {'一致': '✓', '高风险': '✗', '中风险': '?', '低风险': '±', '格式差异': 'F', '待人工': '?',
                 '疑聚合差异': '≈', '已并入聚合差异': '·',
                 '译文未匹配': '∅', '译文多出': '＋', '非锚定区(忽略)': '·'}.get(p.status, '?')
     for it in en_rows:
@@ -1071,7 +1074,7 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         ws.append(row)
         for c in range(3, len(headers) + 1):
             v = ws.cell(row=ws.max_row, column=c).value
-            for st, m in [('不一致', '✗'), ('需复核', '?'), ('格式差异', 'F'), ('待人工', '?'),
+            for st, m in [('高风险', '✗'), ('中风险', '?'), ('低风险', '±'), ('格式差异', 'F'), ('待人工', '?'),
                           ('疑聚合差异', '≈'), ('译文未匹配', '∅')]:
                 if v == m:
                     ws.cell(row=ws.max_row, column=c).fill = FILL[st]
@@ -1086,16 +1089,17 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
     ws.append([])
     ws.append(['图例'])
     legend = [
-        ('✓', '一致：匹配成功且归一化数值相等'),
-        ('✗', '不一致：数值不同，必须处理'),
+        ('✓', '一致：匹配成功且归一化数值相等，无风险(绿)'),
+        ('✗', '高风险：数值不同或真缺失，必须处理(红)'),
+        ('?', '中风险：无法确认对应(串位/聚合疑点/跨页等), 建议核对(黄)'),
+        ('±', '低风险：大位移确认(值相同但位置大幅移动), 抽查项(蓝)'),
         ('F', '格式差异：数值相同但书写不同(如 2.5 vs 2,5)'),
-        ('?', '需复核：无法确认对应(串位/聚合疑点/跨页等), 保守转人工'),
         ('?', '待人工：匹配存在歧义或数字个数不同'),
         ('∅', '译文未匹配：英文有此检查点但译文未找到红字(疑漏标)'),
         ('≈', '疑聚合差异：译文将相邻检查点的数字聚为一体，已合并为单条'),
         ('·', '已并入聚合差异：上述合并项的原未匹配项，不重复计数'),
         ('＋', '译文多出：译文有红字但英文无对应'),
-        ('', '底色说明：绿=一致 红=不一致 橙=格式差异 黄=待人工/未匹配 暗金=疑聚合 灰=已并入'),
+        ('', '底色说明：绿=一致 蓝=低风险 红=高风险 黄=中风险/待人工/未匹配 暗金=疑聚合 灰=已并入'),
     ]
     for sym, desc in legend:
         ws.append([sym, desc])
@@ -1104,7 +1108,9 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         if sym == '✓':
             ws.cell(row=r, column=1).fill, ws.cell(row=r, column=2).fill = FILL['一致'], FILL['一致']
         elif sym == '✗':
-            ws.cell(row=r, column=1).fill, ws.cell(row=r, column=2).fill = FILL['不一致'], FILL['不一致']
+            ws.cell(row=r, column=1).fill, ws.cell(row=r, column=2).fill = FILL['高风险'], FILL['高风险']
+        elif sym == '±':
+            ws.cell(row=r, column=1).fill, ws.cell(row=r, column=2).fill = FILL['低风险'], FILL['低风险']
         elif sym == 'F':
             ws.cell(row=r, column=1).fill, ws.cell(row=r, column=2).fill = FILL['格式差异'], FILL['格式差异']
         elif sym == '?':
@@ -1132,11 +1138,11 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         ['英文指示稿', en_file],
         ['检查点编号', 'P{页码}-{页内序号}, 以英文指示稿为准, 全语言统一'],
         [''],
-        ['状态定义'],
-        ['一致', '能确认对应且数值等价(含大位移确认/指纹锁定/编号列对齐/点逗写法差异, 备注说明)'],
-        ['不一致', '确认对应但数值不同(真差异), 或值在对面完全不存在(真缺失/多余); 红色, 必须处理'],
-        ['需复核', '无法确认对应(可能串位/聚合/跨页位移), 保守转人工; 黄色, 建议核对'],
-        ['大位移确认', '计入一致; 译排版重排导致红字大幅移动, 由上下邻居插值+唯一候选+偏差达标确认, 备注含判据'],
+        ['状态定义(风险分级)'],
+        ['一致', '能确认对应且数值等价, 无风险(绿)'],
+        ['低风险', '大位移确认: 值相同但译排版重排导致红字大幅移动, 由上下邻居插值+唯一候选+偏差达标确认; 抽查项(蓝)'],
+        ['中风险', '无法确认对应(可能串位/聚合/跨页位移/图内), 保守转人工; 黄色, 建议核对'],
+        ['高风险', '确认对应但数值不同(真差异), 或值在对面完全不存在(真缺失/多余); 红色, 必须处理'],
         ['已并入聚合差异', '聚合/锚定合并后的原项, 不重复计为问题 (灰色, 供追溯)'],
         ['非锚定区(忽略)', '不在客户红框内, 非校对对象 (灰, 不统计)'],
         [''],
@@ -1165,9 +1171,10 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
     ws.column_dimensions['A'].width = 16
     ws.column_dimensions['B'].width = 80
     ws['A1'].font = Font(bold=True, size=14)
-    for rw, key in [(6, '状态定义'), (14, '自动判定底线'), (17, '置信度'), (21, '使用方法')]:
+    for rw, key in [(6, '状态定义'), (13, '自动判定底线'), (16, '置信度'), (20, '使用方法')]:
         for r in range(1, ws.max_row + 1):
-            if ws.cell(row=r, column=1).value == key:
+            v = ws.cell(row=r, column=1).value
+            if v and v.startswith(key):
                 ws.cell(row=r, column=1).font = Font(bold=True)
                 break
 
@@ -1198,6 +1205,9 @@ header .meta{color:#b8c7dc;font-size:12px;line-height:1.7}
 .filters{padding:14px 32px;display:flex;gap:8px;flex-wrap:wrap;position:sticky;top:0;background:#f0f2f5;z-index:9;border-bottom:1px solid #e1e4e8}
 .filters button{border:1px solid #d0d7de;background:#fff;border-radius:16px;padding:5px 14px;cursor:pointer;font-size:13px}
 .filters button.active{background:#1f3a5f;color:#fff;border-color:#1f3a5f}
+.filters button.btn-high{background:#cf222e;color:#fff;border-color:#cf222e}
+.filters button.btn-mid{background:#e3b341;color:#fff;border-color:#e3b341}
+.filters button.btn-low{background:#0969da;color:#fff;border-color:#0969da}
 main{padding:20px 32px 60px}
 section.lang{margin-bottom:28px;background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.08);overflow:hidden}
 section.lang>h2{font-size:15px;padding:12px 20px;background:#fafbfc;border-bottom:1px solid #e1e4e8;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
@@ -1206,14 +1216,14 @@ section.lang>h2 .fname{color:#57606a;font-size:12px;font-weight:400}
 .allpass{padding:16px 20px;color:#1a7f37}
 .item{border-left:4px solid #d0d7de;padding:14px 20px;border-bottom:1px solid #eee}
 .item:last-child{border-bottom:none}
-.item.st-不一致{border-left-color:#cf222e}.item.st-需复核{border-left-color:#e3b341}.item.st-格式差异{border-left-color:#fb8500}
+.item.st-高风险{border-left-color:#cf222e}.item.st-中风险{border-left-color:#e3b341}.item.st-低风险{border-left-color:#0969da}.item.st-不一致{border-left-color:#cf222e}.item.st-需复核{border-left-color:#e3b341}.item.st-格式差异{border-left-color:#fb8500}
 .item.st-待人工,.item.st-译文未匹配,.item.st-译文多出{border-left-color:#e3b341}
 .item.st-疑聚合差异{border-left-color:#b8860b}
 .item.st-大位移{border-left-color:#0969da}
 .item .head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-bottom:10px}
 .item .cp{font-weight:600;font-size:13px}
 .badge{display:inline-block;font-size:12px;padding:2px 10px;border-radius:10px;color:#fff}
-.b-不一致{background:#cf222e}.b-需复核{background:#e3b341}.b-格式差异{background:#fb8500}.b-待人工,.b-译文未匹配,.b-译文多出{background:#bf8700}.b-大位移{background:#0969da}.b-一致{background:#1a7f37}.b-疑聚合差异{background:#b8860b}
+.b-高风险{background:#cf222e}.b-中风险{background:#e3b341}.b-低风险{background:#0969da}.b-不一致{background:#cf222e}.b-需复核{background:#e3b341}.b-格式差异{background:#fb8500}.b-待人工,.b-译文未匹配,.b-译文多出{background:#bf8700}.b-大位移{background:#0969da}.b-一致{background:#1a7f37}.b-疑聚合差异{background:#b8860b}
 .compare{display:flex;gap:14px;align-items:stretch;flex-wrap:wrap}
 figure{background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:8px;text-align:center}
 figure img{max-width:330px;max-height:180px;display:block}
@@ -1239,17 +1249,14 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
     import html as _h
     from datetime import datetime
 
-    status_key = {'不一致': '不一致', '需复核': '需复核'}
+    status_key = {'高风险': '高风险', '中风险': '中风险', '低风险': '低风险'}
     cnt = Counter()
-    n_sp = 0
     for r in results:
         for p in r['pairs']:
             if p.status in IGNORED_STATUSES:
                 continue                 # 合并项不重复计数
             if p.status in status_key:
                 cnt[p.status] += 1
-            elif p.status == '一致' and '大位移' in p.note:
-                n_sp += 1
     n_items = len(en_items) * len(results)
     n_ok = n_items - sum(cnt.values())
 
@@ -1293,36 +1300,30 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
         f'&nbsp;|&nbsp; 检查点: {len(en_items)}/语言 &nbsp;|&nbsp; 生成时间: {datetime.now():%Y-%m-%d %H:%M}</div></header>',
         '<div class="dash">',
         f'<div class="stat ok"><b>{n_ok}</b><span>一致</span></div>',
-        f'<div class="stat info"><b>{n_sp}</b><span>大位移确认</span></div>',
-        f'<div class="stat err"><b>{cnt["不一致"]}</b><span>不一致</span></div>',
-        f'<div class="stat warn"><b>{cnt["格式差异"]}</b><span>格式差异</span></div>',
-        f'<div class="stat warn"><b>{cnt["待人工"]}</b><span>待人工</span></div>',
-        f'<div class="stat warn"><b>{cnt["疑聚合差异"]}</b><span>疑聚合差异</span></div>',
-        f'<div class="stat warn"><b>{cnt["译文未匹配"]}</b><span>译文未匹配</span></div>',
-        f'<div class="stat warn"><b>{cnt["译文多出"]}</b><span>译文多出</span></div>',
+        f'<div class="stat info"><b>{cnt["低风险"]}</b><span>低风险(大位移)</span></div>',
+        f'<div class="stat warn"><b>{cnt["中风险"]}</b><span>中风险(需复核)</span></div>',
+        f'<div class="stat err"><b>{cnt["高风险"]}</b><span>高风险(不一致)</span></div>',
         f'<div class="stat"><b>{len(en_items)}×{len(results)}</b><span>检查点总数</span></div>',
         '</div>',
     ]
 
-    # 筛选按钮
-    btns = [('all', '全部', sum(cnt.values()))]
-    for st in ['不一致', '需复核']:
+    # 筛选按钮(按风险颜色)
+    btns = [('all', '全部', '', sum(cnt.values()))]
+    for st, label, col in [('高风险', '高风险', 'btn-high'), ('中风险', '中风险', 'btn-mid'), ('低风险', '低风险', 'btn-low')]:
         if cnt[st]:
-            btns.append((st, st, cnt[st]))
-    if n_sp:
-        btns.append(('大位移', '大位移确认', n_sp))
+            btns.append((st, label, col, cnt[st]))
     parts.append('<div class="filters"><button class="active" data-f="all" onclick="setFilter(this.dataset.f)">'
-                 f'全部 ({btns[0][2]})</button>')
-    for f, label, n in btns[1:]:
-        parts.append(f'<button data-f="{f}" onclick="setFilter(this.dataset.f)">{label} ({n})</button>')
+                 f'全部 ({btns[0][3]})</button>')
+    for f, label, col, n in btns[1:]:
+        parts.append(f'<button class="{col}" data-f="{f}" onclick="setFilter(this.dataset.f)">{label} ({n})</button>')
     parts.append('</div><main>')
 
     # 语言区块
     for r in results:
         lang = r['lang']
         lname = LANG_NAMES.get(lang, lang)
-        probs = [p for p in r['pairs'] if p.status != '一致' and p.status not in IGNORED_STATUSES]
-        sps = [p for p in r['pairs'] if p.status == '一致' and '大位移' in p.note]
+        probs = [p for p in r['pairs'] if p.status not in ('一致',) + IGNORED_STATUSES]
+        sps = []
         problems = len(probs)
         concl = '✓ 通过' if problems == 0 else f'⚠ 需人工({problems}项)'
         bcolor = '#1a7f37' if problems == 0 else '#bf8700'
@@ -1330,15 +1331,14 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
                      f'{lname} <span class="fname">{_h.escape(r["file"])} · 检查点{len(en_items)} '
                      f'· 一致{len(en_items) - problems}</span>'
                      f'<span class="badge" style="background:{bcolor}">{concl}</span></h2>')
-        if not probs and not sps:
+        if not probs:
             parts.append('<div class="allpass">✓ 本语言全部通过, 无需处理</div></section>')
             continue
-        for p in probs + sps:
-            is_sp = p.status == '一致'
-            st = '大位移' if is_sp else p.status
+        for p in probs:
+            st = p.status
             ev = p.en.text if p.en else '(无)'
             xv = p.xx.text if p.xx else '(缺失)'
-            same = p.status == '一致'
+            same = p.status == '低风险'
             vv_en = 'v-same' if same else 'vv-en'
             vv_xx = 'v-same' if same else 'vv-xx'
             pg = p.en.page + 1 if p.en else (p.xx.page + 1 if p.xx else '-')
@@ -1515,6 +1515,13 @@ def align_entry_columns_spans(pairs: list, en_doc: fitz.Document, xx_doc: fitz.D
                     continue
                 if p.status not in ('不一致', '待人工'):
                     continue
+                # 必须: 英文检查点文本是纯编号 n, 且 x 在编号列附近(±10pt), 防止把同行的数据值误当编号
+                if not re.fullmatch(r'%d' % n, p.en.text.strip()):
+                    continue
+                if not re.fullmatch(r'%d' % n, p.xx.text.strip()):
+                    continue
+                if abs(p.en.xc - ex) > 10 or abs(p.xx.xc - xx) > 10:
+                    continue
                 if p.en.page == pno and abs(p.en.yc - ey) <= 8 and p.xx.page == pno and abs(p.xx.yc - xy) <= 8:
                     p.status = '一致'
                     p.note = f'编号列对齐: 编号 {n} ({p.en.text}) ↔ 译文编号 {n} ({p.xx.text}), 排版位移已按序对齐'
@@ -1559,20 +1566,45 @@ def attach_fp(items: list, doc: fitz.Document) -> None:
     return items
 
 
+def _count_unpaired(items: list, vals: list, pno: int, fp: str, paired_ids: set) -> int:
+    """同页同指纹同值、且未被配对的剩余候选数量。"""
+    n = 0
+    for it in items:
+        if it.page != pno or id(it) in paired_ids:
+            continue
+        if fp and it.fp and it.fp != fp:
+            continue
+        itoks = TOKEN_RE.findall(it.text)
+        if vals and any(any(_num_eq(v, t) for t in itoks) for v in vals):
+            n += 1
+    return n
+
+
 def finalize_statuses(pairs: list, en_items: list, xx_items: list) -> int:
     """报告前状态归一化(保守):
       一致     : 配对上且值相同(含大位移/指纹/编号列/点逗写法, 备注保留)
       不一致   : 真差异/真缺失(对面无剩余候选值)
-      需复核   : 无法确认(对面有未配对候选, 疑串位)
+      需复核   : 无法确认(对面有未配对候选, 疑串位); 图内红字一律需复核
     """
     changed = 0
     # 已配对集合
     paired_xx = {id(p.xx) for p in pairs if p.xx is not None}
     paired_en = {id(p.en) for p in pairs if p.en is not None}
     for p in pairs:
+        # 大位移确认(一致+大位移备注) -> 低风险(独立档, 抽查项)
+        if p.status == '一致' and '大位移' in p.note:
+            p.status = '低风险'
+            continue
         if p.status in IGNORED_STATUSES or p.status == '一致':
             continue
+        # 图内红字(图注/箭头/分数标记)受图重排影响大, 一律保守归需复核, 不判不一致
+        if p.en is not None and is_figure_red(p.en.text, p.en.left_ctx, p.en.right_ctx):
+            p.status = '需复核'
+            p.note = '需复核(图内红字,图重排易致位置失真): ' + p.note
+            changed += 1
+            continue
         if p.status == '不一致':
+            # 值确认不同 -> 保留不一致(即使低置信, 值不同是事实; 低置信仅表示位置存疑需人工复核坐标)
             continue
         if p.en is not None:
             vals = TOKEN_RE.findall(p.en.text)
@@ -1584,38 +1616,67 @@ def finalize_statuses(pairs: list, en_items: list, xx_items: list) -> int:
             # 译文未匹配: 期望位置(expect_y)±35pt 内, 同指纹同值的候选存在?
             # 存在 -> 串位(需复核); 不存在 -> 真缺失(不一致)
             def near_exists():
-                if p.expect_y is None or not vals:
-                    return _count_unpaired(xx_items, vals, p.en.page, p.en.fp, paired_xx) > 0
-                for it in xx_items:
-                    if it.page != p.en.page or abs(it.yc - p.expect_y) > 20:
-                        continue
-                    if p.en.fp and it.fp and it.fp != p.en.fp:
-                        continue
-                    itoks = TOKEN_RE.findall(it.text)
-                    if any(any(_num_eq(v, t) for t in itoks) for v in vals):
-                        return True
-                return False
+                # 1) 期望位置±20pt 内同指纹同值(未配对候选优先) -> 串位(需复核)
+                if p.expect_y is not None and vals:
+                    for it in xx_items:
+                        if it.page != p.en.page or abs(it.yc - p.expect_y) > 20:
+                            continue
+                        if p.en.fp and it.fp and it.fp != p.en.fp:
+                            continue
+                        itoks = TOKEN_RE.findall(it.text)
+                        if any(any(_num_eq(v, t) for t in itoks) for v in vals):
+                            return True
+                # 2) 同页有未配对剩余候选(值串位到别处) -> 需复核
+                return _count_unpaired(xx_items, vals or [], p.en.page, p.en.fp, paired_xx) > 0
             if near_exists():
                 p.status = '需复核'
                 p.note = '需复核(值存在但未配到,疑串位): ' + p.note
             else:
+                # 期望位置无值且无剩余候选: 真缺失(强信号) -> 不一致, 需人工最终确认
                 p.status = '不一致'
                 p.note = '真缺失(期望位置无对应值): ' + p.note
             changed += 1
         else:
             vals = TOKEN_RE.findall(p.xx.text)
-            has_remain = _count_unpaired(en_items, vals, p.xx.page, p.xx.fp, paired_en)
-            if has_remain:
+            # 值在同页英文检查点存在(无论是否已配对) -> 疑串位(需复核)
+            exists_same_page = any(
+                it.page == p.xx.page and any(_num_eq(v, t) for t in TOKEN_RE.findall(it.text))
+                for v in vals for it in en_items)
+            if exists_same_page:
                 p.status = '需复核'
-                p.note = '需复核(值存在但未配到,疑串位): ' + p.note
+                p.note = '需复核(值存在于英文,疑串位): ' + p.note
             else:
                 p.status = '不一致'
-                p.note = '真多余(值在英文不存在或候选已用): ' + p.note
+                p.note = '真多余(值在英文不存在): ' + p.note
             changed += 1
+    # 输出状态映射: 内部旧名 -> 四档风险
+    for p in pairs:
+        if p.status == '不一致':
+            p.status = '高风险'
+        elif p.status == '需复核':
+            p.status = '中风险'
     return changed
 
 
-def _count_unpaired(items: list, vals: list, pno: int, fp: str, paired_ids: set) -> int:
+# 图内/图注重排红字特征: 仅保留图注专属(词/符号), 避免误伤正文数字
+FIGURE_FEATURES = [
+    # 图注专属词(多国语)
+    'air inlet', 'air outlet', 'airflow', 'see figure', 'see fig',
+    'figure', 'fig.', 'aufnahme', 'abluft', 'anlage', 'montage', 'einbau',
+    'entrée d\'air', 'sortie d\'air', 'fixation', 'puesta', 'flujo', 'montaje',
+    'ingresso', 'uscita', 'fissaggio', 'inlaat', 'uitlaat', 'bevestig',
+    'entrada', 'saída', 'fixação', 'prívod', 'odvod', 'pripevnenie',
+    'clear', 'fix ', 'attach', 'shows', 'показано', 'ábra', 'picture', 'photo',
+    'felt', 'filzband', 'tape', 'cinta', 'ruban', 'nastro', 'klebeband', 'bande',
+    # 图注符号(不常见于正文数字旁)
+    'ø', '※', '→', '←', '↑', '↓', '◎', '○', '●',
+]
+
+
+def is_figure_red(text: str, ctx_l: str = '', ctx_r: str = '') -> bool:
+    """红字是否在图标注/图形注释区域(易于重排导致位置失真)。仅图注专属词/符号。"""
+    s = (ctx_l + ' ' + text + ' ' + ctx_r).lower()
+    return any(f.lower() in s for f in FIGURE_FEATURES)
     """同页同指纹同值、且未被配对的剩余候选数量。"""
     n = 0
     for it in items:
@@ -1798,8 +1859,8 @@ def main():
         lang_snap = os.path.join(snaps_dir, lang)
         n_snaps = 0
         for p in pairs:
-            # 一致且非大位移确认 -> 无需截图; 大位移确认(位移大)同样配截图供人工核对; 已并入项不再单独截图
-            if p.status == '一致' and '大位移' not in p.note:
+            # 一致 -> 无需截图; 低风险(大位移确认,位移大)配截图供人工抽查; 已并入项不截图
+            if p.status == '一致':
                 continue
             if p.status in IGNORED_STATUSES:
                 continue
@@ -1826,7 +1887,7 @@ def main():
                         os.path.join(lang_snap, f'{tag}_{lang}_XX@期望位置.png'))
                     n_snaps += 1
         problems = sum(1 for p in pairs if p.status != '一致' and p.status not in IGNORED_STATUSES)
-        n_sp = sum(1 for p in pairs if p.status == '一致' and '大位移' in p.note)
+        n_sp = sum(1 for p in pairs if p.status == '低风险')
         r['n_sp'] = n_sp
         # 复核 PDF: 仅需人工确认的问题项(大位移/排版差异已自动判一致, 不需生成)
         marks = []
@@ -1855,7 +1916,7 @@ def main():
             en_marks.setdefault(key, {'bbox': p.en.bbox, 'langs': set()})
             en_marks[key]['langs'].add(lang)
         print(f'  [{lang}] {fname}: 检查点{len(en_items)} 译文红字{r["n_xx"]} '
-              f'问题项{problems} 大位移确认{n_sp} (截图{n_snaps}张 复核PDF{len(marks)}框)')
+              f'问题项{problems} 低风险{n_sp} (截图{n_snaps}张 复核PDF{len(marks)}框)')
         doc.close()
 
     # 英文指示稿复核 PDF: 标注所有问题检查点位置, 供点击英文截图定位
