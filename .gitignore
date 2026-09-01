@@ -1,5 +1,4 @@
 dist/
 build/
-*.spec
 __pycache__/
 _gui_screen.png
