@@ -104,6 +104,10 @@ class Pair:
     note: str
     expect_y: float | None = None   # 未匹配项在译文坐标系的插值期望 y(供截图)
     expect_dx: float | None = None  # 页级 x 偏移(供截图定位)
+    locate_page: int | None = None    # 该问题在译文定位 PDF 中的页码(1基, 供 HTML 跳转)
+    en_locate_page: int | None = None # 英文侧定位 PDF 页码
+    en_clip: tuple | None = None      # 英文截图实际裁剪区域(pt, 供 HTML 画框)
+    xx_clip: tuple | None = None      # 译文截图实际裁剪区域(pt, 供 HTML 画框)
 
 # ---------------- 提取 ----------------
 def is_red_core(color: int) -> bool:
@@ -943,6 +947,7 @@ def snap(doc: fitz.Document, pno: int, bbox, path: str):
     r = fitz.Rect(r.x0 - SNAP_PAD, r.y0 - SNAP_PAD, r.x1 + SNAP_PAD, r.y1 + SNAP_PAD) & page.rect
     pix = page.get_pixmap(clip=r, dpi=SNAP_DPI)
     pix.save(path)
+    return r   # 返回实际裁剪区域(pt), 供 HTML 按百分比叠画问题框
 
 # ---------------- Excel 报告 ----------------
 FILL = {
@@ -1272,19 +1277,47 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
             f = os.path.join(snaps_dir, lang, f'{tag}_{lang}_XX@期望位置.png')
             cap = f'{LANG_NAMES.get(lang, lang)} · 期望位置(未找到红字)'
         img = _b64(f)
-        # 需人工确认项可点击打开复核 PDF 定位
+        # 需人工确认项可点击打开定位 PDF(每问题一页, 打开即定位)
         need_review = p.status not in ('一致',) + IGNORED_STATUSES
         if need_review:
             if kind == 'EN' and p.en is not None:
-                href = f'复核PDF/EN.pdf#page={p.en.page + 1}'   # 英文截图 -> 英文指示稿复核版
-                pg = p.en.page + 1
+                pg = p.en_locate_page or (p.en.page + 1)
+                href = f'复核PDF/EN.pdf#page={pg}'   # 英文截图 -> 英文定位 PDF
+                clip = p.en_clip
             elif p.xx is not None:
-                href = f'复核PDF/{lang}.pdf#page={p.xx.page + 1}'  # 译文截图 -> 对应语言复核版
-                pg = p.xx.page + 1
+                pg = p.locate_page or (p.xx.page + 1)
+                href = f'复核PDF/{lang}.pdf#page={pg}'  # 译文截图 -> 对应语言定位 PDF
+                clip = p.xx_clip
             else:
-                href = f'复核PDF/{lang}.pdf#page={p.en.page + 1}'  # 期望位置 -> 对应语言复核版
-                pg = p.en.page + 1
-            inner = f'<figure class="linkable" style="cursor:pointer" title="点击打开复核PDF定位(第{pg}页)"><img src="{img}"><figcaption>{cap} · 点击定位</figcaption></figure>'
+                pg = p.locate_page or (p.en.page + 1)
+                href = f'复核PDF/{lang}.pdf#page={pg}'  # 期望位置 -> 对应语言定位 PDF
+                clip = None
+            # 在截图上叠加黄底红边框, 精确标出问题数字位置(按实际裁剪区百分比定位)
+            box = ''
+            if clip:
+                if kind == 'EN' and p.en is not None:
+                    bb = p.en.bbox
+                elif p.xx is not None:
+                    bb = p.xx.bbox
+                else:
+                    bb = None
+                if bb is not None:
+                    cx0, cy0, cx1, cy1 = clip
+                    cw, ch = cx1 - cx0, cy1 - cy0
+                if bb is not None and cw > 0 and ch > 0:
+                    bw = max(bb[2] - bb[0], 2.0)
+                    bh = max(bb[3] - bb[1], 2.0)
+                    l = max((bb[0] - 1.5 - cx0) / cw * 100, 0.0)
+                    t = max((bb[1] - 1.5 - cy0) / ch * 100, 0.0)
+                    wd = min((bw + 3) / cw * 100, 100.0 - l)
+                    ht = min((bh + 3) / ch * 100, 100.0 - t)
+                    box = (f'<div style="position:absolute;left:{l:.1f}%;top:{t:.1f}%;'
+                           f'width:{wd:.1f}%;height:{ht:.1f}%;'
+                           f'background:rgba(255,230,60,.45);'
+                           f'pointer-events:none"></div>')
+            inner = (f'<figure class="linkable" style="position:relative;cursor:pointer" '
+                     f'title="点击打开定位PDF(定位页{pg})">{box}<img src="{img}">'
+                     f'<figcaption>{cap} · 点击定位</figcaption></figure>')
             return f'<a href="{href}" target="_blank">{inner}</a>'
         return f'<figure><img src="{img}"><figcaption>{cap}</figcaption></figure>'
 
@@ -1700,25 +1733,57 @@ def _snap_tag(p: Pair) -> str:
     return 'XX'
 
 
-def build_review_pdf(src_pdf: str, out_path: str, marks: list):
-    """生成译文复核 PDF: 拷自译文源文件, 问题数字区域加高亮批注(悬停显示说明),
-    不画框不压版面; 密集区域多数字高亮也不会互相干扰。
-    marks: [(page0, rect, label, dashed)] — dashed 保留兼容(高亮统一, 忽略)"""
-    doc = fitz.open(src_pdf)
-    for pno, rect, label, _dashed in marks:
-        page = doc[pno]
-        r = fitz.Rect(rect) & page.rect
-        if r.width < 2 or r.height < 2:
-            continue
-        # 高亮批注(黄色半透明), 直接标注在数字区域
-        ha = page.add_highlight_annot(r)
-        ha.set_colors(stroke=(1, 0.92, 0.23))
-        ha.update()
-        # 悬停才显示的说明气泡, 不占版面
-        ta = page.add_text_annot(r, label, icon='note')
-        ta.update()
-    doc.save(out_path, garbage=3, deflate=True)
-    doc.close()
+def build_locate_pdf(src_pdf: str, out_path: str, rows: list):
+    """问题定位 PDF: 每个问题独占一页, 打开即定位, 无需甄别.
+    rows: [(page0, rect, title, lines)]  — page0 为源文档页(0基), rect 为问题区域(pt),
+          title 为信息条主行, lines 为附加说明行列表.
+    页面布局: 顶部信息条(检查点/风险/值对比) + 原文整页渲染图(180dpi)
+              + 问题处黄底红边双框(页面上唯一高亮).
+    """
+    YELLOW = (1.0, 0.92, 0.23)
+    RED = (0.81, 0.13, 0.18)
+    GRAY = (0.35, 0.35, 0.35)
+    out = fitz.open()
+    src = fitz.open(src_pdf)
+    pix_cache: dict = {}
+    try:
+        total = len(rows)
+        for idx, (page0, rect, title, lines) in enumerate(rows, 1):
+            sp = src[page0]
+            page = out.new_page(width=595, height=842)   # A4 纵向
+            # 信息条(中文需内置 CJK 字体, 否则丢失)
+            page.insert_text((20, 24), title, fontsize=11.5, color=RED,
+                             fontname='china-s')
+            y = 42
+            for ln in lines[:4]:
+                page.insert_text((20, y), ln, fontsize=9, color=GRAY,
+                                 fontname='china-s')
+                y += 13
+            # 原文整页渲染图
+            area = fitz.Rect(15, 92, 580, 812)
+            scale = min(area.width / sp.rect.width, area.height / sp.rect.height)
+            w, h = sp.rect.width * scale, sp.rect.height * scale
+            x0 = area.x0 + (area.width - w) / 2
+            y0 = area.y0 + (area.height - h) / 2
+            if page0 not in pix_cache:
+                pix_cache[page0] = sp.get_pixmap(dpi=180)
+            page.insert_image(fitz.Rect(x0, y0, x0 + w, y0 + h), pixmap=pix_cache[page0])
+            # 问题框: 黄底(半透明) + 红边, 页面上唯一
+            r = fitz.Rect(rect) & sp.rect
+            if r.width >= 1 and r.height >= 1:
+                fr = fitz.Rect(x0 + r.x0 * scale - 2.5, y0 + r.y0 * scale - 2.5,
+                               x0 + r.x1 * scale + 2.5, y0 + r.y1 * scale + 2.5) & page.rect
+                shape = page.new_shape()
+                shape.draw_rect(fr)
+                # 黄色半透明高亮覆盖数字区域(无框, 与 PDF 高亮习惯一致)
+                shape.finish(fill=YELLOW, fill_opacity=0.5)
+                shape.commit()
+            # 角标: 定位页码 / 总页数
+            page.insert_text((555, 830), f'{idx}/{total}', fontsize=8, color=(0.5, 0.5, 0.5))
+        out.save(out_path, garbage=3, deflate=True)
+    finally:
+        out.close()
+        src.close()
 
 
 def cross_validate_aggregation(results: list):
@@ -1858,12 +1923,12 @@ def run_job(base, anchor, data_dir, out=None, log=print):
             os.makedirs(lang_snap, exist_ok=True)
             tag = _snap_tag(p)
             if p.en is not None:
-                snap(en_doc, p.en.page, p.en.bbox,
-                     os.path.join(lang_snap, f'{tag}_{lang}_EN.png'))
+                p.en_clip = snap(en_doc, p.en.page, p.en.bbox,
+                                 os.path.join(lang_snap, f'{tag}_{lang}_EN.png'))
                 n_snaps += 1
             if p.xx is not None:
-                snap(doc, p.xx.page, p.xx.bbox,
-                     os.path.join(lang_snap, f'{tag}_{lang}_XX.png'))
+                p.xx_clip = snap(doc, p.xx.page, p.xx.bbox,
+                                 os.path.join(lang_snap, f'{tag}_{lang}_XX.png'))
                 n_snaps += 1
             elif p.status == '译文未匹配' and p.expect_y is not None:
                 # 译文侧期望位置截图(缺失处上下文)
@@ -1880,25 +1945,36 @@ def run_job(base, anchor, data_dir, out=None, log=print):
         problems = sum(1 for p in pairs if p.status != '一致' and p.status not in IGNORED_STATUSES)
         n_sp = sum(1 for p in pairs if p.status == '低风险')
         r['n_sp'] = n_sp
-        # 复核 PDF: 仅需人工确认的问题项(大位移/排版差异已自动判一致, 不需生成)
-        marks = []
+        # 定位 PDF: 每个问题独占一页(打开即定位, 页上唯一黄底红边框)
+        loc_rows = []
+        lname = LANG_NAMES.get(lang, lang)
         for p in pairs:
             if p.status in ('一致',) + IGNORED_STATUSES:
                 continue
             if p.xx is not None:
-                marks.append((p.xx.page, p.xx.bbox, f'{p.cp or "?"} CHECK', False))
+                page0 = p.xx.page
+                rect = p.xx.bbox
+                xv = p.xx.text
             elif p.status == '译文未匹配' and p.expect_y is not None and p.en is not None:
+                page0 = p.en.page
                 cx = (p.en.bbox[0] + p.en.bbox[2]) / 2 + (p.expect_dx or 0.0)
                 hh = max(p.en.bbox[3] - p.en.bbox[1], 10.0)
-                marks.append((p.en.page, (cx - 45, p.expect_y - hh / 2 - 8,
-                                          cx + 45, p.expect_y + hh / 2 + 8),
-                              f'{p.cp} MISSING?', True))
+                rect = (cx - 45, p.expect_y - hh / 2 - 8, cx + 45, p.expect_y + hh / 2 + 8)
+                xv = '(缺失, 框为期望位置)'
             else:
-                marks.append((p.xx.page if p.xx else 0, (40, 40, 200, 80),
-                              f'{p.cp or "?"} CHECK', False))
-        if marks:
+                page0 = p.xx.page if p.xx else 0
+                rect = p.xx.bbox if p.xx else (40, 40, 200, 80)
+                xv = p.xx.text if p.xx else '(缺失)'
+            p.locate_page = len(loc_rows) + 1
+            ev = p.en.text if p.en is not None else '(无)'
+            title = f'{p.cp or "(译文多出)"} · {lname} · {p.status}'
+            lines = [f'原文页码: {page0 + 1}    英文值: {ev} → 译文值: {xv}']
+            if p.note:
+                lines.append('备注: ' + p.note[:90])
+            loc_rows.append((page0, rect, title, lines))
+        if loc_rows:
             os.makedirs(review_dir, exist_ok=True)
-            build_review_pdf(path, os.path.join(review_dir, f'{lang}.pdf'), marks)
+            build_locate_pdf(path, os.path.join(review_dir, f'{lang}.pdf'), loc_rows)
         # 收集英文侧标注(同一检查点多语言问题叠加)
         for p in pairs:
             if p.status in ('一致',) + IGNORED_STATUSES or p.en is None:
@@ -1907,18 +1983,28 @@ def run_job(base, anchor, data_dir, out=None, log=print):
             en_marks.setdefault(key, {'bbox': p.en.bbox, 'langs': set()})
             en_marks[key]['langs'].add(lang)
         log(f'  [{lang}] {fname}: 检查点{len(en_items)} 译文红字{r["n_xx"]} '
-              f'问题项{problems} 低风险{n_sp} (截图{n_snaps}张 复核PDF{len(marks)}框)')
+              f'问题项{problems} 低风险{n_sp} (截图{n_snaps}张 定位PDF{len(loc_rows)}页)')
         doc.close()
 
-    # 英文指示稿复核 PDF: 标注所有问题检查点位置, 供点击英文截图定位
+    # 英文指示稿定位 PDF: 每个问题检查点独占一页
     en_rows = []
     for key, info in sorted(en_marks.items()):
         page0, yc, x0 = key
         langs = ','.join(sorted(info['langs']))
-        en_rows.append([page0, info['bbox'], f'CHECK ({langs})', True])
+        en_rows.append([page0, info['bbox'], f'英文指示稿 · {page0 + 1}页 · 问题语言: {langs}', []])
+        info['page_no'] = len(en_rows)          # 该检查点在 EN 定位 PDF 中的页码
+    # 回填每条问题的英文侧定位页码
+    for r in results:
+        for p in r['pairs']:
+            if p.en is None or p.status in ('一致',) + IGNORED_STATUSES:
+                continue
+            key = (p.en.page, round(p.en.yc, 1), round(p.en.bbox[0], 1))
+            info = en_marks.get(key)
+            if info and 'page_no' in info:
+                p.en_locate_page = info['page_no']
     if en_rows:
         os.makedirs(review_dir, exist_ok=True)
-        build_review_pdf(base, os.path.join(review_dir, 'EN.pdf'), en_rows)
+        build_locate_pdf(base, os.path.join(review_dir, 'EN.pdf'), en_rows)
 
     report = os.path.join(out_dir, '数字校对报告.xlsx')
     build_excel(report, os.path.basename(base), en_items, results, snaps_dir, color_notes)
