@@ -74,7 +74,7 @@ TOKEN_RE = re.compile(r'\d+(?:[.,]\d+)*')
 FP_RE = re.compile(r'(N[·•.]?m|kgf[·•.]?cm|kgf/cm|MPa|kPa|mm²|mm|Hz|°C|psi|bar|kg/cm|m³|R290|R32|R410A?|MSZ-|MUZ-|MAC-|WPA|Wi-Fi|R29\d|R3\d|ø|±|×|∅|%)', re.I)
 
 # 不进入问题项统计/截图/报告的状态(供统一排除)
-IGNORED_STATUSES = ('已并入聚合差异', '非锚定区(忽略)')
+IGNORED_STATUSES = ('已并入聚合差异', '非锚定区(忽略)', '目录条目(不校对)')
 
 # ---------------- 数据结构 ----------------
 @dataclass
@@ -1009,6 +1009,7 @@ FILL = {
     '译文多出':  PatternFill('solid', fgColor='FFC000'),
     '已并入聚合差异': PatternFill('solid', fgColor='BFBFBF'),
     '非锚定区(忽略)': PatternFill('solid', fgColor='D9D9D9'),
+    '目录条目(不校对)': PatternFill('solid', fgColor='BFBFBF'),
     '一致':     PatternFill('solid', fgColor='70AD47'),
     'high':    PatternFill('solid', fgColor='70AD47'),
     'medium':  PatternFill('solid', fgColor='FFC000'),
@@ -1111,7 +1112,7 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
                 xx_only.append((r['lang'], p))
     def mark(p):
         return {'一致': '✓', '高风险': '✗', '中风险': '?', '低风险': '±', '格式差异': 'F', '待人工': '?',
-                '疑聚合差异': '≈', '已并入聚合差异': '·',
+                '疑聚合差异': '≈', '已并入聚合差异': '·', '目录条目(不校对)': 'T',
                 '译文未匹配': '∅', '译文多出': '＋', '非锚定区(忽略)': '·'}.get(p.status, '?')
     for it in en_rows:
         idx = en_by_page[it.page].index(it) + 1
@@ -1124,7 +1125,7 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         for c in range(3, len(headers) + 1):
             v = ws.cell(row=ws.max_row, column=c).value
             for st, m in [('高风险', '✗'), ('中风险', '?'), ('低风险', '±'), ('格式差异', 'F'), ('待人工', '?'),
-                          ('疑聚合差异', '≈'), ('译文未匹配', '∅')]:
+                          ('疑聚合差异', '≈'), ('译文未匹配', '∅'), ('目录条目(不校对)', 'T')]:
                 if v == m:
                     ws.cell(row=ws.max_row, column=c).fill = FILL[st]
             if v == '·':
@@ -1150,6 +1151,7 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         ('≈', '疑聚合差异：译文将相邻检查点的数字聚为一体，已合并为单条'),
         ('·', '已并入聚合差异：上述合并项的原未匹配项，不重复计数'),
         ('＋', '译文多出：译文有红字但英文无对应'),
+        ('T', '目录条目(不校对)：点线目录行的章节号/页码, 随各语言重排可变, 不计入问题(备注保留差异供抽查)'),
         ('', '底色说明：绿=一致 蓝=低风险 红=高风险 黄=中风险/待人工/未匹配 暗金=疑聚合 灰=已并入'),
     ]
     for sym, desc in legend:
@@ -1196,6 +1198,7 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         ['高风险', '确认对应但数值不同(真差异), 或值在对面完全不存在(真缺失/多余); 红色, 必须处理'],
         ['已并入聚合差异', '聚合/锚定合并后的原项, 不重复计为问题 (灰色, 供追溯)'],
         ['非锚定区(忽略)', '不在客户红框内, 非校对对象 (灰, 不统计)'],
+        ['目录条目(不校对)', '点线目录行的章节号/页码, 页码随各语言重排可变, 不作数值校对 (灰, 不统计, 备注留差异)'],
         [''],
         ['自动判定底线'],
         ['原则', '不确定不判一致; 自动判一致仅有: ①高/中置信+值相等 ②大位移三判据 ③指纹锁定(唯一) ④编号列对齐 ⑤点逗写法'  ],
@@ -1711,6 +1714,65 @@ def finalize_statuses(pairs: list, en_items: list, xx_items: list) -> int:
     return changed
 
 
+# ---------------- 目录条目(点线条)结果级处理 ----------------
+# 目录行形如 "1.......7"(章节号+点线+页码), 红字提取后被水平行聚类粘成一项。
+# 点线判定只以英文侧(校对基准)为准: 译文侧点线数量/跨span不稳定, 不得据此删项过滤
+# (旧方案双侧各自正则过滤 -> 英文删译文未删 -> 成批假"真缺失/真多余"高风险)。
+# 对称性由"同页 + y 对齐英文目录条目行"事实兑底。
+TOC_LINE_RE = re.compile(r'\.{4,}')      # 点线: ≥4 个连续点
+TOC_PAGE_MIN = 3                         # 同页至少这么多个点线条目才认定为目录页
+TOC_Y_TOL = 14.0                         # 译文项归入目录行的 y 对齐容差 (pt)
+
+
+def is_toc_row(it) -> bool:
+    """该项所在行是否点线目录行: 自身文本(整行含点线)或紧邻上下文命中点线。"""
+    s = (it.left_ctx or '') + (it.right_ctx or '') + it.text
+    return bool(TOC_LINE_RE.search(s))
+
+
+def toc_entry_pages(en_items: list) -> dict:
+    """识别目录页(仅以英文侧为准): 返回 {page: [英文目录行 item, ...]}。"""
+    by_page: dict = {}
+    for it in en_items:
+        if is_toc_row(it):
+            by_page.setdefault(it.page, []).append(it)
+    return {pg: its for pg, its in by_page.items() if len(its) >= TOC_PAGE_MIN}
+
+
+def in_toc_rows(it, toc_pages: dict) -> bool:
+    """该项是否落在目录页且 y 对齐某条英文点线条目行(章节号/页码两列同 yc)。"""
+    rows = toc_pages.get(it.page)
+    if not rows:
+        return False
+    return any(abs(it.yc - e.yc) <= TOC_Y_TOL for e in rows)
+
+
+def resolve_toc_alignments(pairs: list, toc_pages: dict) -> int:
+    """目录条目对称降档(必须在 resolve_aggregation/finalize_statuses 之前):
+    以英文侧为准命中目录行的 pair -> 标'目录条目(不校对)', 不判不一致/缺失/多余;
+    值相同(一致)的保持"一致"不动基线统计; 译文孤儿 y 对齐英文目录行的同步降档。
+    不删任何检查点、不动匹配代价/权重。"""
+    if not toc_pages:
+        return 0
+    changed = 0
+    for p in pairs:
+        if p.status in ('一致',) or p.status in IGNORED_STATUSES:
+            continue   # 值相同保持通过; 已忽略项不动
+        if p.en is not None and in_toc_rows(p.en, toc_pages):
+            p.status = '目录条目(不校对)'
+            p.note = ('目录条目(点线行): 章节号/页码随各语言重排可能变化, 不作数值校对; '
+                      + p.note)
+            changed += 1
+            continue
+        # 译文孤儿: y 对齐英文目录行 -> 同为目录页码/编号变体, 不判真多余
+        if p.en is None and p.xx is not None and in_toc_rows(p.xx, toc_pages):
+            p.status = '目录条目(不校对)'
+            p.note = ('目录条目(点线行): 译文页码/编号与英文不同或重排所致, 不作数值校对; '
+                      + p.note)
+            changed += 1
+    return changed
+
+
 # 图内/图注重排红字特征: 仅保留图注专属(词/符号), 避免误伤正文数字
 FIGURE_FEATURES = [
     # 图注专属词(多国语)
@@ -1855,6 +1917,9 @@ def run_job(base, anchor, data_dir, out=None, log=print):
         log(f'锚定模式: {anchor} (红框区域, 框内数字为校对对象)')
     en_items = extract_items(en_doc, en_color_counter)
     attach_fp(en_items, en_doc)
+    toc_pages = toc_entry_pages(en_items)   # 目录页(仅英文侧判定): 后续对称降档用
+    if toc_pages:
+        log('目录页识别: ' + ', '.join(f'P{pg + 1}({len(its)}条点线条目)' for pg, its in sorted(toc_pages.items())))
     if anchor:
         n_in = sum(1 for it in en_items if in_anchor(it, anchor_zones))
         log(f'英文检查点(全量)={len(en_items)} 框内(锚定)={n_in}')
@@ -1908,6 +1973,7 @@ def run_job(base, anchor, data_dir, out=None, log=print):
                         if not inbox:
                             p.status = '非锚定区(忽略)'
                             p.note = '非锚定区: 译文项不在客户红框范围内'
+        resolve_toc_alignments(pairs, toc_pages)   # 目录条目对称降档(不删项/不动权重)
         resolve_aggregation(pairs, xx_items)
         if anchor_zones:
             # 编号列对齐(span级): 目录/列表编号按序对齐, 消除排版位移误报
