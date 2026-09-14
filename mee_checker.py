@@ -106,8 +106,6 @@ class Pair:
     expect_dx: float | None = None  # 页级 x 偏移(供截图定位)
     locate_page: int | None = None    # 该问题在译文定位 PDF 中的页码(1基, 供 HTML 跳转)
     en_locate_page: int | None = None # 英文侧定位 PDF 页码
-    en_clip: tuple | None = None      # 英文截图实际裁剪区域(pt, 供 HTML 画框)
-    xx_clip: tuple | None = None      # 译文截图实际裁剪区域(pt, 供 HTML 画框)
 
 # ---------------- 提取 ----------------
 def is_red_core(color: int) -> bool:
@@ -947,7 +945,6 @@ def snap(doc: fitz.Document, pno: int, bbox, path: str):
     r = fitz.Rect(r.x0 - SNAP_PAD, r.y0 - SNAP_PAD, r.x1 + SNAP_PAD, r.y1 + SNAP_PAD) & page.rect
     pix = page.get_pixmap(clip=r, dpi=SNAP_DPI)
     pix.save(path)
-    return r   # 返回实际裁剪区域(pt), 供 HTML 按百分比叠画问题框
 
 # ---------------- Excel 报告 ----------------
 FILL = {
@@ -1283,40 +1280,14 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
             if kind == 'EN' and p.en is not None:
                 pg = p.en_locate_page or (p.en.page + 1)
                 href = f'复核PDF/EN.pdf#page={pg}'   # 英文截图 -> 英文定位 PDF
-                clip = p.en_clip
             elif p.xx is not None:
                 pg = p.locate_page or (p.xx.page + 1)
                 href = f'复核PDF/{lang}.pdf#page={pg}'  # 译文截图 -> 对应语言定位 PDF
-                clip = p.xx_clip
             else:
                 pg = p.locate_page or (p.en.page + 1)
                 href = f'复核PDF/{lang}.pdf#page={pg}'  # 期望位置 -> 对应语言定位 PDF
-                clip = None
-            # 在截图上叠加黄底红边框, 精确标出问题数字位置(按实际裁剪区百分比定位)
-            box = ''
-            if clip:
-                if kind == 'EN' and p.en is not None:
-                    bb = p.en.bbox
-                elif p.xx is not None:
-                    bb = p.xx.bbox
-                else:
-                    bb = None
-                if bb is not None:
-                    cx0, cy0, cx1, cy1 = clip
-                    cw, ch = cx1 - cx0, cy1 - cy0
-                if bb is not None and cw > 0 and ch > 0:
-                    bw = max(bb[2] - bb[0], 2.0)
-                    bh = max(bb[3] - bb[1], 2.0)
-                    l = max((bb[0] - 1.5 - cx0) / cw * 100, 0.0)
-                    t = max((bb[1] - 1.5 - cy0) / ch * 100, 0.0)
-                    wd = min((bw + 3) / cw * 100, 100.0 - l)
-                    ht = min((bh + 3) / ch * 100, 100.0 - t)
-                    box = (f'<div style="position:absolute;left:{l:.1f}%;top:{t:.1f}%;'
-                           f'width:{wd:.1f}%;height:{ht:.1f}%;'
-                           f'background:rgba(255,230,60,.45);'
-                           f'pointer-events:none"></div>')
-            inner = (f'<figure class="linkable" style="position:relative;cursor:pointer" '
-                     f'title="点击打开定位PDF(定位页{pg})">{box}<img src="{img}">'
+            inner = (f'<figure class="linkable" style="cursor:pointer" '
+                     f'title="点击打开定位PDF(定位页{pg})"><img src="{img}">'
                      f'<figcaption>{cap} · 点击定位</figcaption></figure>')
             return f'<a href="{href}" target="_blank">{inner}</a>'
         return f'<figure><img src="{img}"><figcaption>{cap}</figcaption></figure>'
@@ -1923,12 +1894,12 @@ def run_job(base, anchor, data_dir, out=None, log=print):
             os.makedirs(lang_snap, exist_ok=True)
             tag = _snap_tag(p)
             if p.en is not None:
-                p.en_clip = snap(en_doc, p.en.page, p.en.bbox,
-                                 os.path.join(lang_snap, f'{tag}_{lang}_EN.png'))
+                snap(en_doc, p.en.page, p.en.bbox,
+                     os.path.join(lang_snap, f'{tag}_{lang}_EN.png'))
                 n_snaps += 1
             if p.xx is not None:
-                p.xx_clip = snap(doc, p.xx.page, p.xx.bbox,
-                                 os.path.join(lang_snap, f'{tag}_{lang}_XX.png'))
+                snap(doc, p.xx.page, p.xx.bbox,
+                     os.path.join(lang_snap, f'{tag}_{lang}_XX.png'))
                 n_snaps += 1
             elif p.status == '译文未匹配' and p.expect_y is not None:
                 # 译文侧期望位置截图(缺失处上下文)
