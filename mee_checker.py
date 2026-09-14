@@ -771,7 +771,13 @@ def _digits_compose(rest: str, pieces: list):
     return used
 
 
-def resolve_aggregation(pairs: list[Pair]):
+def owner_en_of(xx_id: int, owner: dict):
+    """返回占用该 xx 项的 pair 的 en (None 表示译文多出项或未占用)。"""
+    p = owner.get(xx_id)
+    return p.en if p is not None else None
+
+
+def resolve_aggregation(pairs: list[Pair], xx_items: list | None = None):
     """聚合差异合并(双向): 满足四条件的「待人工+未匹配」或「待人工+多出」成对
     -> 待人工项重标为「疑聚合差异」单条, 残项标为「已并入聚合差异」不重复计数。
     方向一(译文聚合/英文拆散): 待人工项译文token>英文token, 残为未匹配邻项;
@@ -936,6 +942,49 @@ def resolve_aggregation(pairs: list[Pair]):
                 continue
             if _multiset_eq(E, X):
                 q.status = '一致'
+
+    # 分支B: 译文未匹配(未配对), 但期望位置附近的候选是粘连项
+    # (译文 tokens = 短数字前缀 + 英文值, 同指纹) -> 从译文多出项收养, 补配判一致并备注
+    owner = {id(p.xx): p for p in pairs if p.xx is not None}
+    # 只排除被正常配对(en非None)占用的项; 被"译文多出"(en=None)占用的项允许收养
+    used_ids = {id(xx) for xx in owner if owner_en_of(xx, owner) is not None}
+    for p in pairs:
+        if p.status != '译文未匹配' or p.en is None:
+            continue
+        et = TOKEN_RE.findall(p.en.text)
+        if not et:
+            continue
+        for it in xx_items:
+            if it.page != p.en.page or id(it) in used_ids:
+                continue
+            if abs(it.yc - p.en.yc) > 25:
+                continue
+            if p.en.fp and it.fp and it.fp != p.en.fp:
+                continue
+            xt = TOKEN_RE.findall(it.text)
+            if len(xt) <= len(et) or len(xt) - len(et) > 2:
+                continue
+            done = False
+            for dh in range(0, len(xt) - len(et) + 1):
+                if xt[dh:dh + len(et)] == et and all(re.fullmatch(r'\d{1,2}', t) for t in xt[:dh]):
+                    pre = xt[:dh]
+                    old = owner.get(id(it))
+                    if old is not None and old.en is None:
+                        # 原"译文多出"项收养后并入本检查点, 不再单独计问题
+                        old.status = '已并入聚合差异'
+                        old.note = f'已并入检查点 {p.cp}(译文粘连注释标号), 不再单独计为问题项'
+                        old.xx = None
+                    p.xx = it
+                    p.y_off = round(it.yc - p.en.yc, 1)
+                    p.conf = 'medium'
+                    p.status = '一致'
+                    p.note = (f"译文值含额外注释标号前缀 {' '.join(pre)}(疑注释编号粘连), "
+                              f"数值 {p.en.text} 与译文一致; 建议人工过一眼")
+                    used_ids.add(id(it))
+                    done = True
+                    break
+            if done:
+                break
     return pairs
 
 # ---------------- 截图 ----------------
@@ -1028,7 +1077,7 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
             se = os.path.join('snaps', r['lang'], f"{p.cp or 'XX'}_{r['lang']}_EN.png") if p.en and has_snap else ''
             sx = os.path.join('snaps', r['lang'], f"{p.cp or 'XX'}_{r['lang']}_XX.png") if p.xx and has_snap else ''
             sx2 = os.path.join('snaps', r['lang'], f"{p.cp or 'XX'}_{r['lang']}_XX@期望位置.png") \
-                if (p.status == '译文未匹配' and p.expect_y is not None) else ''
+                if (p.xx is None and p.expect_y is not None) else ''
             ws.append([r['lang'], r['file'], p.cp, p.page, p.status, p.conf,
                        en_v, xx_v, p.y_off if p.y_off is not None else '', p.note, se, sx or sx2])
             cell = ws.cell(row=ws.max_row, column=5)
@@ -1084,6 +1133,8 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         ws.append([])
         ws.append(['— 以下为译文多出项 —'])
         for lang, p in xx_only:
+            if p.xx is None:
+                continue   # 已被分支B收养并入对应检查点, 不再单列
             ws.append([f'(译文多出)', p.xx.text, *[lang if l == lang else '' for l in langs]])
     # 矩阵下方图例
     ws.append([])
@@ -1857,7 +1908,7 @@ def run_job(base, anchor, data_dir, out=None, log=print):
                         if not inbox:
                             p.status = '非锚定区(忽略)'
                             p.note = '非锚定区: 译文项不在客户红框范围内'
-        resolve_aggregation(pairs)
+        resolve_aggregation(pairs, xx_items)
         if anchor_zones:
             # 编号列对齐(span级): 目录/列表编号按序对齐, 消除排版位移误报
             align_entry_columns_pairs(pairs, en_items, xx_items)
@@ -1901,7 +1952,7 @@ def run_job(base, anchor, data_dir, out=None, log=print):
                 snap(doc, p.xx.page, p.xx.bbox,
                      os.path.join(lang_snap, f'{tag}_{lang}_XX.png'))
                 n_snaps += 1
-            elif p.status == '译文未匹配' and p.expect_y is not None:
+            elif p.xx is None and p.expect_y is not None and p.en is not None:
                 # 译文侧期望位置截图(缺失处上下文)
                 e = p.en
                 cx = (e.bbox[0] + e.bbox[2]) / 2 + (p.expect_dx or 0.0)
@@ -1926,7 +1977,7 @@ def run_job(base, anchor, data_dir, out=None, log=print):
                 page0 = p.xx.page
                 rect = p.xx.bbox
                 xv = p.xx.text
-            elif p.status == '译文未匹配' and p.expect_y is not None and p.en is not None:
+            elif p.expect_y is not None and p.en is not None and p.xx is None:
                 page0 = p.en.page
                 cx = (p.en.bbox[0] + p.en.bbox[2]) / 2 + (p.expect_dx or 0.0)
                 hh = max(p.en.bbox[3] - p.en.bbox[1], 10.0)
