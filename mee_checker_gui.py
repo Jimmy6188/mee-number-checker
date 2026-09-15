@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""MEE 多国语数字校对工具 - 图形界面版 (v1.3)
+"""MEE 多国语数字校对工具 - 图形界面版 (v1.4)
 
 用法: 双击运行(或 python mee_checker_gui.py)
 需要: 英文红字指示稿(必填) + 多国语PDF文件夹(必填) + 客户锚定原稿(可选)
@@ -15,7 +15,7 @@ from tkinter import ttk, filedialog, messagebox
 
 import mee_checker
 
-APP_TITLE = 'MEE 多国语数字校对工具 v1.3'
+APP_TITLE = 'MEE 多国语数字校对工具 v1.4'
 
 
 class GUIApp:
