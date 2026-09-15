@@ -2041,6 +2041,9 @@ def hl_classify(t: str) -> str:
         return 'ord'
     if (re.fullmatch(r'[A-Za-z0-9/\-().,%+²³°:]{2,24}', tt) and re.search(r'[A-Za-z]', tt)
             and re.search(r'\d', tt)):
+        # 含可译小写单词(3-core/4-adrig): 单词跨语言必变, 数字才是稳定锚 → phrase
+        if re.search(r'[a-z]', tt):
+            return 'phrase'
         return 'code'
     if re.fullmatch(r'[\d.,/\-–:()%\s≤≥±°]+', tt) and re.search(r'\d', tt):
         return 'symstr'
@@ -2068,8 +2071,9 @@ def hl_highlight_rects(page) -> list:
 
 
 def extract_highlight_items(anchor_doc, zones: list, log=print):
-    """提取红框∩高亮的检查点(行级合并) + 跳过清单(句子级/框外高亮供人工核对).
-    返回 (items: list[Item], skipped: list[(page1, text, 原因)])"""
+    """提取红框∩高亮的检查点(字符级精确提取 + 片段合并) + 跳过清单.
+    必须按字符判定: 长 span 内只高亮一个词('under 40 °C' 只涂 40 / '1-2. SPECIFICATIONS'
+    只涂 1-2.)时, span 级覆盖率只有 3~17% 必漏。返回 (items, skipped)。"""
     items, skipped = [], []
     for pno in range(anchor_doc.page_count):
         page = anchor_doc[pno]
@@ -2078,39 +2082,55 @@ def extract_highlight_items(anchor_doc, zones: list, log=print):
         if not hls:
             continue
 
-        def cover(r):
+        def char_covered(r):
+            """字符被高亮: 字符垂直中心落在某矩形内(±1pt) 且水平重叠≥50%字符宽"""
             if zs and not any(r.intersects(z) for z in zs):
-                return 0.0
-            inter = 0.0
+                return False
+            cy = (r.y0 + r.y1) / 2
             for h in hls:
-                ix = max(0.0, min(r.x1, h.x1) - max(r.x0, h.x0))
-                iy = max(0.0, min(r.y1, h.y1) - max(r.y0, h.y0))
-                inter += ix * iy
-            return inter / max(r.width * r.height, 1.0)
+                if h.y0 - 1.0 <= cy <= h.y1 + 1.0:
+                    ix = max(0.0, min(r.x1, h.x1) - max(r.x0, h.x0))
+                    if ix >= max(r.width * 0.5, 0.4):
+                        return True
+            return False
 
         row = {}
-        for b in page.get_text('dict')['blocks']:
+        for b in page.get_text('rawdict')['blocks']:
             if b.get('type') != 0:
                 continue
             for l in b.get('lines', []):
                 for sp in l.get('spans', []):
-                    t = sp['text'].strip()
-                    if not t:
-                        continue
-                    r = fitz.Rect(sp['bbox'])
-                    if cover(r) >= HL_COVER_MIN:
+                    for ch in sp.get('chars', []):
+                        c = ch['c']
+                        if not c:
+                            continue
+                        r = fitz.Rect(ch['bbox'])
                         key = round((r.y0 + r.y1) / 2 / 4.0)
-                        row.setdefault(key, []).append((r.x0, r.x1, t, (r.y0 + r.y1) / 2))
-        for key, parts in sorted(row.items()):
-            parts.sort()
-            merged = []
-            for x0, x1, t, yc in parts:
-                if merged and x0 - merged[-1][1] < 2.0:
-                    merged[-1] = (merged[-1][0], x1, merged[-1][2] + t, merged[-1][3])
+                        row.setdefault(key, []).append((r.x0, r.x1, c, char_covered(r), (r.y0 + r.y1) / 2))
+        for key, chars in sorted(row.items()):
+            chars.sort()
+            cov_idx = [i for i, ch in enumerate(chars) if ch[3] and not ch[2].isspace()]
+            if not cov_idx:
+                continue
+            # 相邻覆盖字符分组(间隙<6pt 同片段)
+            groups = []
+            for i in cov_idx:
+                if groups and chars[i][0] - chars[groups[-1][-1]][1] < 6.0:
+                    groups[-1].append(i)
                 else:
-                    merged.append((x0, x1, t, (x0, yc)))
-            for x0, x1, t, (_, yc) in merged:
-                t = t.strip()
+                    groups.append([i])
+            for g in groups:
+                lo, hi = g[0], g[-1]
+                # 词边界补全: 客户手绘高亮常只涂型号中段('MXZ-'未涂), 向两侧扩展到完整词
+                while lo > 0 and not chars[lo - 1][2].isspace() \
+                        and chars[lo][0] - chars[lo - 1][1] < 1.5:
+                    lo -= 1
+                while hi < len(chars) - 1 and not chars[hi + 1][2].isspace() \
+                        and chars[hi + 1][0] - chars[hi][1] < 1.5:
+                    hi += 1
+                x0, x1 = chars[lo][0], chars[hi][1]
+                yc = chars[g[0]][4]
+                t = ''.join(chars[k][2] for k in range(lo, hi + 1)).strip()
                 if not t:
                     continue
                 zt = fitz.Rect(x0, yc - 4, x1, yc + 4)
@@ -2137,7 +2157,8 @@ def extract_highlight_items(anchor_doc, zones: list, log=print):
 
 def hl_page_lines(doc):
     """译文行级文本重建: {page0: [(yc, 归一化行文本, 原始行文本, x0, x1)]}
-    (型号/参数常被拆成多 span, 字面搜索必漏, 必须行级拼接)"""
+    先按 y 分行、行内按 x 排序拼接: 上下标(CO₂ 的 2 / mm²)yc 与正文差仅几分之一 pt,
+    若按 (yc,x0) 全局排序会被排到行尾; 行内 x 排序天然落回原位。"""
     pages = {}
     for pno in range(doc.page_count):
         spans = []
@@ -2148,21 +2169,27 @@ def hl_page_lines(doc):
                 for s in l.get('spans', []):
                     t = s['text'].strip()
                     if t:
-                        spans.append((round((s['bbox'][1] + s['bbox'][3]) / 2, 1),
+                        spans.append(((s['bbox'][1] + s['bbox'][3]) / 2,
                                       s['bbox'][0], s['bbox'][2], t))
-        spans.sort(key=lambda x: (x[0], x[1]))
-        lines = []
-        for yc, x0, x1, t in spans:
-            if lines and abs(yc - lines[-1][0]) <= 5.0:
-                prev_x1 = lines[-1][4]
-                join = '' if x0 - prev_x1 < 1.5 else ' '
-                lines[-1][0] = (lines[-1][0] + yc) / 2
-                lines[-1][1] += join + t
-                lines[-1][2] += join + t
-                lines[-1][4] = x1
+        spans.sort(key=lambda x: x[0])
+        groups = []   # [center_yc, [spans...]]
+        for sp in spans:
+            if groups and sp[0] - groups[-1][0] <= 5.0:
+                groups[-1][1].append(sp)
+                groups[-1][0] = sum(q[0] for q in groups[-1][1]) / len(groups[-1][1])
             else:
-                lines.append([yc, hl_norm(t), t, x0, x1])
-        pages[pno] = [(l[0], l[1], l[2], l[3], l[4]) for l in lines]
+                groups.append([sp[0], [sp]])
+        out = []
+        for cy, grp in groups:
+            grp.sort(key=lambda q: q[1])
+            text = ''
+            prev_x1 = None
+            for yc, x0, x1, t in grp:
+                join = '' if prev_x1 is None or x0 - prev_x1 < 1.5 else ' '
+                text += join + t
+                prev_x1 = max(prev_x1 or 0, x1)
+            out.append((cy, hl_norm(text), text, grp[0][1], prev_x1))
+        pages[pno] = out
     return pages
 
 
@@ -2189,7 +2216,11 @@ def hl_keys(item) -> list:
     if item.hl_type == 'code' and re.search(r'[,，/]', t):
         toks = [x.strip() for x in re.split(r'[,，/]', t) if x.strip()]
         if len(toks) >= 2:
-            return [frozenset({x}) for x in toks]
+            return [frozenset({x, x.strip('().,;:!?')}) for x in toks]
+    if item.hl_type == 'code':
+        # 去尾标点变体: 英文高亮片段 'CN750.' vs 译文 'CN750'
+        stripped = t.strip('().,;:!?')
+        return [frozenset({t, stripped})] if stripped and stripped != t else [frozenset({t})]
     return [frozenset({t})]
 
 
@@ -2207,9 +2238,13 @@ def _hl_line_hit(ntext: str, key_groups: list, loose: bool, all_tokens: bool = F
             return any(g in ntext for g in group)
         g0 = next(iter(group))
         if re.fullmatch(r'[\d.,]+', g0):
-            return any(re.search(r'(?<![\d.,])' + re.escape(g) + r'(?![\d.,])', ntext)
+            # 纯数字: 防 0.8 命中 10.8/0.85, 但允许句尾点号(675.)
+            return any(re.search(r'(?<![\d.,])' + re.escape(g) + r'(?!\d)(?![.,]\d)', ntext)
                        for g in group)
-        return any(g in ntext for g in group)
+        if any(g in ntext for g in group):
+            return True
+        ns = ntext.replace(' ', '')   # 去空格兜底: 行重建 'CO 2' vs 键 'CO2'
+        return any(g.replace(' ', '') in ns for g in group)
     if all_tokens:
         return bool(key_groups) and all(one(g) for g in key_groups)
     return any(one(g) for g in key_groups)
@@ -2239,7 +2274,35 @@ def hl_find_in_lines(item, pages: dict, pno0: int, y_off: float = 0.0, page_off:
         if cands:
             cands.sort(key=lambda c: (abs(c[0] - item.page), abs(c[1] - item.yc - y_off)))
             return cands[0]
+    if enum_code_fallback(item, keys, pages, order, y_off):
+        p = order[0]
+        return (p, item.yc + y_off, keys[0], '枚举型号跨行断词: 各 token 同页分别命中')
+    # 断词连行兜底: 型号被行断 'MXZ-' / '2HB50VF)' → 相邻行拼接后查找
+    if item.hl_type == 'code':
+        for g in keys:
+            for p in order:
+                plines = pages.get(p, [])
+                for i in range(len(plines) - 1):
+                    ya, _, ra, _, _ = plines[i]
+                    yb, _, rb, _, _ = plines[i + 1]
+                    if 0 < yb - ya <= 12:
+                        # 下行开头接上行结尾(去空格变体)
+                        joined = ra.rstrip() + rb.lstrip()
+                        if any(x in joined.replace(' ', '') for x in g):
+                            return (p, ya, keys[0], f'型号跨行断词命中: {joined[:40]}')
     return None
+
+
+def enum_code_fallback(item, keys, pages, order, y_off) -> bool:
+    """逗号分隔多型号(如 'MXZ-2HB40VF,MXZ-2HB50VF)')被译文分行断开时,
+    "同行全含"必败; 改为每个型号 token 在同页(含页码偏移页)任意行命中即可。"""
+    if item.hl_type != 'code' or len(keys) <= 1:
+        return False
+    p = item.page
+    for g in keys:
+        if not any(_hl_line_hit(nt, [g], True, False) for _, nt, _, _, _ in pages.get(p, [])):
+            return False
+    return True
 
 
 def hl_page_offset(items, pages, pno0_map=None):
