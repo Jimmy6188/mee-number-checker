@@ -13,6 +13,7 @@ MEE 多国语数字校对工具 (P0)
   4. 输出 Excel 报告(汇总/明细/矩阵/说明) + 问题项双方截图
 """
 import argparse
+import unicodedata
 import base64
 import bisect
 import os
@@ -90,6 +91,7 @@ class Item:
     left_ctx: str = ''   # 骨架上下文: 同行紧邻左侧非红文本尾部
     right_ctx: str = ''  # 骨架上下文: 同行紧邻右侧非红文本头部
     fp: str = ''         # 语义指纹: 数字邻接的语言无关token(单位/型号/符号)
+    hl_type: str = ''    # 高亮模式内容类型: num/code/ord/symstr/phrase
 
     @property
     def xc(self) -> float:
@@ -2014,6 +2016,352 @@ def lang_code(fname: str) -> str:
     return os.path.splitext(fname)[0]
 
 
+# ---------------- 高亮模式(客户指示稿红框∩青色高亮 = 校对对象) ----------------
+# 与红字模式的区别: 检查点来自"指示稿红框内被青色高亮覆盖的内容"(数字/型号/参数/序号),
+# 译文侧无红字锚点也可校; 提取只信绘图层小矩形(整页级注释是编辑器全选残留, 必须过滤)。
+HL_COVER_MIN = 0.5          # span 被高亮矩形覆盖比例阈
+HL_OBJ_AREA_MAX = 0.05      # 单个高亮对象面积 > 页面 5% -> 操作残留, 丢弃
+
+
+def hl_norm(s: str) -> str:
+    """高亮内容归一化: NFKC(全半角/上下标数字) + 连字符族 -> '-' + 空格族剔除"""
+    s = unicodedata.normalize('NFKC', s)
+    s = re.sub(r'[\u2010\u2011\u2012\u2013\u2014\u2212\u2043\u2212]', '-', s)
+    s = re.sub(r'[\u00a0\u2000-\u200b\ufeff]', '', s)
+    return s.strip()
+
+
+def hl_classify(t: str) -> str:
+    """高亮内容类型: num 纯数字 / ord 序号 / code 型号代码 / symstr 数字符号串 /
+    phrase 短参数短语 / text 句子级(不作检查点)"""
+    tt = t.strip().strip('.·*')
+    if re.fullmatch(r'\d+(?:[.,]\d+)*', tt):
+        return 'num'
+    if re.fullmatch(r'[(（]?\d+[)）.、]', t.strip()) or re.fullmatch(r'[①-⑳]', t.strip()):
+        return 'ord'
+    if (re.fullmatch(r'[A-Za-z0-9/\-().,%+²³°:]{2,24}', tt) and re.search(r'[A-Za-z]', tt)
+            and re.search(r'\d', tt)):
+        return 'code'
+    if re.fullmatch(r'[\d.,/\-–:()%\s≤≥±°]+', tt) and re.search(r'\d', tt):
+        return 'symstr'
+    if len(tt.split()) <= 3 and len(tt) <= 24:
+        return 'phrase'
+    return 'text'
+
+
+def hl_highlight_rects(page) -> list:
+    """页内真高亮矩形: 青色填充绘图矩形 + 小尺寸 Highlight 注释; 异常大对象过滤"""
+    page_area = max(page.rect.get_area(), 1.0)
+    out = []
+    for dr in page.get_drawings():
+        f = dr.get('fill')
+        if f and _color_match(tuple(f), ANCHOR_FILL):
+            r = fitz.Rect(dr['rect'])
+            if r.width > 0.5 and r.height > 0.5 and r.get_area() < page_area * HL_OBJ_AREA_MAX:
+                out.append(r)
+    for a in (page.annots() or []):
+        if a.type[1] == 'Highlight':
+            r = fitz.Rect(a.rect)
+            if r.get_area() < page_area * HL_OBJ_AREA_MAX:
+                out.append(r)
+    return out
+
+
+def extract_highlight_items(anchor_doc, zones: list, log=print):
+    """提取红框∩高亮的检查点(行级合并) + 跳过清单(句子级/框外高亮供人工核对).
+    返回 (items: list[Item], skipped: list[(page1, text, 原因)])"""
+    items, skipped = [], []
+    for pno in range(anchor_doc.page_count):
+        page = anchor_doc[pno]
+        hls = hl_highlight_rects(page)
+        zs = zones[pno] if pno < len(zones) else []
+        if not hls:
+            continue
+
+        def cover(r):
+            if zs and not any(r.intersects(z) for z in zs):
+                return 0.0
+            inter = 0.0
+            for h in hls:
+                ix = max(0.0, min(r.x1, h.x1) - max(r.x0, h.x0))
+                iy = max(0.0, min(r.y1, h.y1) - max(r.y0, h.y0))
+                inter += ix * iy
+            return inter / max(r.width * r.height, 1.0)
+
+        row = {}
+        for b in page.get_text('dict')['blocks']:
+            if b.get('type') != 0:
+                continue
+            for l in b.get('lines', []):
+                for sp in l.get('spans', []):
+                    t = sp['text'].strip()
+                    if not t:
+                        continue
+                    r = fitz.Rect(sp['bbox'])
+                    if cover(r) >= HL_COVER_MIN:
+                        key = round((r.y0 + r.y1) / 2 / 4.0)
+                        row.setdefault(key, []).append((r.x0, r.x1, t, (r.y0 + r.y1) / 2))
+        for key, parts in sorted(row.items()):
+            parts.sort()
+            merged = []
+            for x0, x1, t, yc in parts:
+                if merged and x0 - merged[-1][1] < 2.0:
+                    merged[-1] = (merged[-1][0], x1, merged[-1][2] + t, merged[-1][3])
+                else:
+                    merged.append((x0, x1, t, (x0, yc)))
+            for x0, x1, t, (_, yc) in merged:
+                t = t.strip()
+                if not t:
+                    continue
+                zt = fitz.Rect(x0, yc - 4, x1, yc + 4)
+                if zs and not any(zt.intersects(z) for z in zs):
+                    skipped.append((pno + 1, t, '高亮在红框外'))
+                    continue
+                typ = hl_classify(t)
+                # TOC 点线行豁免: 整行含 ≥5 连续点 -> 目录页码/章节号, 位置随译文重排不稳
+                full = page.get_textbox(fitz.Rect(max(0.0, x0 - 260), yc - 4,
+                                                  min(page.rect.x1, x1 + 260), yc + 4)) or ''
+                if re.search(r'\.{5,}', full):
+                    typ = 'toc'
+                # 脚注枚举列表(*6, *7, *8 等): 非数据内容, 同 toc 全册豁免
+                if re.fullmatch(r'(?:\*\d+[,，、\s]+)+\*?\d+', t.strip()):
+                    typ = 'toc'
+                if typ == 'text':
+                    skipped.append((pno + 1, t[:60], '句子级文字(一期不校)'))
+                    continue
+                items.append(Item(page=pno, text=t, bbox=(x0, yc - 4, x1, yc + 4),
+                                  yc=yc, n_spans=len(t), hl_type=typ))
+    log(f'高亮提取: 检查点 {len(items)} 个, 跳过 {len(skipped)} 项(句子级/框外, 见清单)')
+    return items, skipped
+
+
+def hl_page_lines(doc):
+    """译文行级文本重建: {page0: [(yc, 归一化行文本, 原始行文本, x0, x1)]}
+    (型号/参数常被拆成多 span, 字面搜索必漏, 必须行级拼接)"""
+    pages = {}
+    for pno in range(doc.page_count):
+        spans = []
+        for b in doc[pno].get_text('dict')['blocks']:
+            if b.get('type') != 0:
+                continue
+            for l in b.get('lines', []):
+                for s in l.get('spans', []):
+                    t = s['text'].strip()
+                    if t:
+                        spans.append((round((s['bbox'][1] + s['bbox'][3]) / 2, 1),
+                                      s['bbox'][0], s['bbox'][2], t))
+        spans.sort(key=lambda x: (x[0], x[1]))
+        lines = []
+        for yc, x0, x1, t in spans:
+            if lines and abs(yc - lines[-1][0]) <= 5.0:
+                prev_x1 = lines[-1][4]
+                join = '' if x0 - prev_x1 < 1.5 else ' '
+                lines[-1][0] = (lines[-1][0] + yc) / 2
+                lines[-1][1] += join + t
+                lines[-1][2] += join + t
+                lines[-1][4] = x1
+            else:
+                lines.append([yc, hl_norm(t), t, x0, x1])
+        pages[pno] = [(l[0], l[1], l[2], l[3], l[4]) for l in lines]
+    return pages
+
+
+def hl_num_variants(tok: str) -> list:
+    """数字 token 的欧式/英式逗号变体"""
+    out = [tok]
+    if '.' in tok:
+        out.append(tok.replace('.', ','))
+    if ',' in tok:
+        out.append(tok.replace(',', '.'))
+    return out
+
+
+def hl_keys(item) -> list:
+    """检索键组: 每组=一个原始 token 的变体集(组内任一命中即算该 token 命中).
+    数字类(含短语/符号串)=全部数值 token; 枚举型 code('*6, *7, *8')拆多 token 同行全含;
+    其余字符串类=归一化原文一组。"""
+    t = hl_norm(item.text)
+    if item.hl_type in ('num', 'symstr', 'phrase', 'toc'):
+        toks = re.findall(r'\d+(?:[.,]\d+)*', t)
+        if not toks:
+            return [frozenset({t})]
+        return [frozenset(hl_num_variants(x)) for x in toks]
+    if item.hl_type == 'code' and re.search(r'[,，/]', t):
+        toks = [x.strip() for x in re.split(r'[,，/]', t) if x.strip()]
+        if len(toks) >= 2:
+            return [frozenset({x}) for x in toks]
+    return [frozenset({t})]
+
+
+def _hl_key_all_tokens(item) -> bool:
+    """需要"同一行全含所有 token"的类型: 短语/符号串/枚举 code"""
+    return item.hl_type in ('phrase', 'symstr') or         (item.hl_type == 'code' and len(hl_keys(item)) > 1)
+
+
+def _hl_line_hit(ntext: str, key_groups: list, loose: bool, all_tokens: bool = False) -> bool:
+    """all_tokens=True: 每个 token 须同一行出现(防 '15 / 20' 单侧数字无关行误命中).
+    纯数字 token 用边界断言(0.8 不命中 10.8); 字符串 token 用子串(code 边界断言会被
+    行级重建的粘连 'MXZ-2G33VG0,8' 反噬, 且型号串歧义低, 子串安全)。"""
+    def one(group):
+        if loose:
+            return any(g in ntext for g in group)
+        g0 = next(iter(group))
+        if re.fullmatch(r'[\d.,]+', g0):
+            return any(re.search(r'(?<![\d.,])' + re.escape(g) + r'(?![\d.,])', ntext)
+                       for g in group)
+        return any(g in ntext for g in group)
+    if all_tokens:
+        return bool(key_groups) and all(one(g) for g in key_groups)
+    return any(one(g) for g in key_groups)
+
+
+def hl_find_in_lines(item, pages: dict, pno0: int, y_off: float = 0.0, page_off: int = 0):
+    """在译文页行集中找高亮内容: 同页优先、邻近页次之, 多命中取 y 最近(行带按页偏移 y_off 校准).
+    字符串类(code/ord)严格未中时允许子串兜底; 序号类强制行带±40(无位置约束的'(1)'无意义).
+    返回 (page0, yc, 命中键, 行文本) 或 None"""
+    keys = hl_keys(item)
+    if not keys:
+        return None
+    loose = item.hl_type in ('code', 'ord')
+    all_tok = _hl_key_all_tokens(item)
+    order = sorted(pages.keys(), key=lambda p: abs(p - pno0 - page_off))
+    # 同页(含页码偏移) strict→loose 先扫(行级粘连的型号在 loose 才命中), 再邻页兜底
+    scans = ([('same', 'strict'), ('same', 'loose'), ('near', 'strict'), ('near', 'loose')]
+             if loose else [('same', 'strict'), ('near', 'strict')])
+    for scope, mode in scans:
+        cands = []
+        for p in (order[:1] if scope == 'same' else order[1:]):
+            for yc, ntext, raw, x0, x1 in pages[p]:
+                if item.hl_type == 'ord' and abs(yc - item.yc - y_off) > 40:
+                    continue
+                if _hl_line_hit(ntext, keys, mode == 'loose', all_tok):
+                    cands.append((p, yc, keys[0], raw))
+        if cands:
+            cands.sort(key=lambda c: (abs(c[0] - item.page), abs(c[1] - item.yc - y_off)))
+            return cands[0]
+    return None
+
+
+def hl_page_offset(items, pages, pno0_map=None):
+    """校准通道(同红字模式 y_med 思路): 第一遍无视带宽收集命中位置, 得
+    (每页 y 偏移中位数 {page0: off}, 全局页码偏移 page_off).
+    译文行高/页码整体位移不靠拍脑袋容差吸收。"""
+    from statistics import median
+    from collections import Counter
+    diffs = {}
+    pdiff = Counter()
+    for it in items:
+        keys = hl_keys(it)
+        if not keys:
+            continue
+        loose = it.hl_type in ('code', 'ord')
+        all_tok = _hl_key_all_tokens(it)
+        # 页码偏移: 全册最近命中页 - 英文页
+        best_all = None
+        for p in sorted(pages, key=lambda q: abs(q - it.page)):
+            for yc, ntext, raw, x0, x1 in pages[p]:
+                if _hl_line_hit(ntext, keys, loose, all_tok):
+                    if best_all is None or abs(yc - it.yc) < abs(best_all[0] - it.yc):
+                        best_all = (yc, p)
+                    break
+        if best_all is not None:
+            pdiff[best_all[1] - it.page] += 1
+        best = None
+        for yc, ntext, raw, x0, x1 in pages.get(it.page, []):
+            if _hl_line_hit(ntext, keys, loose, all_tok):
+                d = yc - it.yc
+                if best is None or abs(d) < abs(best):
+                    best = d
+        if best is not None:
+            diffs.setdefault(it.page, []).append(best)
+    page_off = pdiff.most_common(1)[0][0] if pdiff and pdiff.most_common(1)[0][1] >= 3 else 0
+    return {p: median(v) for p, v in diffs.items() if len(v) >= 3}, page_off
+
+
+def hl_compare_lang(item, pages: dict, y_off: float = 0.0, page_off: int = 0) -> tuple:
+    """单语言比对一个高亮检查点 -> (status, conf, xx_repr, note)
+    行带 = 英文 yc + 页级偏移 y_off ± 40(校准后真正的"同位置");
+      行带内命中             -> 一致(≤20 high, 否则 medium)
+      同页行带外/跨页命中    -> 中风险(疑串位/错印后在他处出现)
+      全册未找到             -> 高风险(真缺失)"""
+    hit = hl_find_in_lines(item, pages, item.page, y_off=y_off, page_off=page_off)
+    if hit:
+        p, yc, key, raw = hit
+        yoff = round(yc - item.yc - y_off, 1)
+        if item.hl_type == 'toc':
+            # 目录页码/脚注枚举: 全册任意页命中即一致(位置随重排不稳, 页级无意义)
+            return '一致', 'medium', raw, f'目录/脚注枚举命中(仅全册值校验): {item.text} (译文页{p + 1})'
+        if p == item.page + page_off and abs(yoff) <= 20:
+            return '一致', 'high', raw, f'高亮{item.hl_type}命中: {item.text} (译文页{p + 1}, 校准y偏移{yoff:+.0f}pt)'
+        if p == item.page + page_off and abs(yoff) <= 40:
+            return '一致', 'medium', raw, f'高亮{item.hl_type}命中(位移较大): {item.text} (译文页{p + 1}, 校准y偏移{yoff:+.0f}pt)'
+        return ('中风险', 'low', raw,
+                f'需复核(疑串位/错印): 高亮 {item.text} 同页行带内未找到, 命中文在译文页{p + 1} y={yc:.0f}: {raw[:50]}')
+    return '高风险', '-', None, f'真缺失: 译文全册未找到高亮内容 {item.text!r}(疑漏印/错印, 必须人工核对)'
+
+
+def run_highlight_job(instruction_pdf, data_dir, out=None, log=print):
+    """高亮模式主流程: 指示稿提取 -> 各译文检索比对 -> 报告(复用四档状态)"""
+    out_dir = out or os.path.join(data_dir, '_高亮校对结果')
+    os.makedirs(out_dir, exist_ok=True)
+    anchor_doc = fitz.open(instruction_pdf)
+    zones = anchor_zone_rects(anchor_doc)
+    items, skipped = extract_highlight_items(anchor_doc, zones, log)
+    files = sorted(f for f in os.listdir(data_dir)
+                   if f.lower().endswith('.pdf')
+                   and os.path.abspath(os.path.join(data_dir, f)) != os.path.abspath(instruction_pdf))
+    log(f'指示稿: {os.path.basename(instruction_pdf)} | 高亮检查点 {len(items)} | 译文 {len(files)} 个')
+    results = []
+    for fname in files:
+        lang = lang_code(fname)
+        doc = fitz.open(os.path.join(data_dir, fname))
+        pages = hl_page_lines(doc)
+        y_offs, page_off = hl_page_offset(items, pages)   # 页级/页码偏移校准
+        pairs = []
+        for i, it in enumerate(items, 1):
+            st, conf, raw, note = hl_compare_lang(it, pages, y_offs.get(it.page, 0.0), page_off)
+            xx = Item(page=it.page, text=raw[:60], bbox=(0, 0, 0, 0), yc=0, n_spans=0) if raw else None
+            pairs.append(Pair(cp=f'HL{i:03d}', page=it.page + 1, en=it, xx=xx,
+                              y_off=None, conf=conf, status=st, note=note))
+        n_ok = sum(1 for p in pairs if p.status == '一致')
+        log(f'  [{lang}] {fname}: 检查点{len(items)} 命中{n_ok} 未命中{len(items)-n_ok}')
+        results.append({'file': fname, 'lang': lang, 'pairs': pairs, 'doc': doc,
+                        'path': os.path.join(data_dir, fname), 'n_xx': 0, 'n_sp': 0, 'cc': Counter()})
+    # 高亮清单(首跑人工核对)
+    import csv
+    with open(os.path.join(out_dir, '高亮清单.csv'), 'w', newline='', encoding='utf-8-sig') as f:
+        w = csv.writer(f)
+        w.writerow(['页', '内容', '类型', '状态'])
+        for it in items:
+            w.writerow([it.page + 1, it.text, it.hl_type, '检查点'])
+        for pg, t, why in skipped:
+            w.writerow([pg, t, '-', why])
+    # 简易汇总 Excel
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = '汇总'
+    ws.append(['文件', '语言', '高亮检查点', '命中(一致)', '未命中(待核对)'])
+    for r in results:
+        ok = sum(1 for p in r['pairs'] if p.status == '一致')
+        ws.append([r['file'], r['lang'], len(r['pairs']), ok, len(r['pairs']) - ok])
+    ws2 = wb.create_sheet('明细')
+    ws2.append(['语言', '检查点', '页', '状态', '高亮内容', '译文命中行', '备注'])
+    import re as _re
+    def _clean(v):
+        return _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', str(v)) if isinstance(v, str) else v
+    for r in results:
+        for p in r['pairs']:
+            ws2.append([r['lang'], p.cp, p.page, p.status, _clean(p.en.text),
+                        _clean(p.xx.text) if p.xx else '', _clean(p.note)])
+    wb.save(os.path.join(out_dir, '高亮校对报告.xlsx'))
+    xlsx = os.path.join(out_dir, '高亮校对报告.xlsx')
+    log(f'报告: {xlsx}\n清单: 高亮清单.csv(首跑请人工核对提取范围)')
+    for d in (anchor_doc, *[r['doc'] for r in results]):
+        d.close()
+    return xlsx, None, out_dir, out_dir
+
+
 def run_job(base, anchor, data_dir, out=None, log=print):
     out_dir = out or os.path.join(data_dir, '_校对结果')
     snaps_dir = os.path.join(out_dir, 'snaps')
@@ -2343,13 +2691,23 @@ def _hungarian_test():
 
 
 def main():
-    ap = argparse.ArgumentParser(description='多国语数字校对工具 (锚定模式) [P0]')
-    ap.add_argument('--base', required=True, help='英文红字指示稿(全标红版) PDF')
-    ap.add_argument('--anchor', default=None, help='可选: 客户高光指示原稿(红框+青色高亮), 提供则启用锚定模式')
+    ap = argparse.ArgumentParser(description='多国语数字校对工具 [P0]')
+    ap.add_argument('--mode', choices=['red', 'highlight'], default='red',
+                    help='red=红字模式(默认, 校全部红字数字); '
+                         'highlight=高亮模式(只校指示稿红框内青色高亮内容: 数字/型号/参数/序号)')
+    ap.add_argument('--base', default=None, help='英文红字指示稿(全标红版) PDF [红字模式必填]')
+    ap.add_argument('--anchor', default=None, help='高亮模式下=客户指示稿(红框+青色高亮, 必填); 红字模式下=可选锚定原稿')
     ap.add_argument('--dir', required=True, help='多国语 PDF 文件夹')
-    ap.add_argument('--out', default=None, help='输出目录 (默认: <dir>/_校对结果)')
+    ap.add_argument('--out', default=None, help='输出目录 (默认: <dir>/_校对结果 或 _高亮校对结果)')
     args = ap.parse_args()
-    run_job(args.base, args.anchor, args.dir, args.out)
+    if args.mode == 'highlight':
+        if not args.anchor:
+            ap.error('高亮模式需要 --anchor 指定客户指示稿(含红框+青色高亮)')
+        run_highlight_job(args.anchor, args.dir, args.out)
+    else:
+        if not args.base:
+            ap.error('红字模式需要 --base 指定英文红字指示稿')
+        run_job(args.base, args.anchor, args.dir, args.out)
 
 
 if __name__ == '__main__':

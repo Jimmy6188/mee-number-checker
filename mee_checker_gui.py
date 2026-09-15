@@ -33,23 +33,35 @@ class GUIApp:
         frm = ttk.Frame(root, padding=10)
         frm.pack(fill='x')
 
-        # 英文指示稿
-        ttk.Label(frm, text='英文指示稿 (红字标注版):').grid(row=0, column=0, sticky='w', **pad)
-        self.var_base = tk.StringVar()
-        tk.Entry(frm, textvariable=self.var_base).grid(row=0, column=1, sticky='ew', **pad)
-        ttk.Button(frm, text='浏览…', command=lambda: self.pick(self.var_base, 'pdf')).grid(row=0, column=2, **pad)
+        # 校对模式
+        ttk.Label(frm, text='校对模式:').grid(row=0, column=0, sticky='w', **pad)
+        self.var_mode = tk.StringVar(value='red')
+        self.cmb_mode = ttk.Combobox(frm, textvariable=self.var_mode, state='readonly', width=46,
+                                     values=['red', 'highlight'])
+        self.cmb_mode.grid(row=0, column=1, sticky='ew', **pad)
+        self.cmb_mode.bind('<<ComboboxSelected>>', self.on_mode_change)
+        self.lbl_mode = ttk.Label(frm, text='红字模式: 校全部红字数字', foreground='#0969da')
+        self.lbl_mode.grid(row=0, column=2, columnspan=1, sticky='w')
 
-        # 锚定原稿(可选)
-        ttk.Label(frm, text='客户锚定原稿 (可选):').grid(row=1, column=0, sticky='w', **pad)
+        # 英文指示稿
+        self.lbl_base = ttk.Label(frm, text='英文指示稿 (红字标注版):')
+        self.lbl_base.grid(row=1, column=0, sticky='w', **pad)
+        self.var_base = tk.StringVar()
+        tk.Entry(frm, textvariable=self.var_base).grid(row=1, column=1, sticky='ew', **pad)
+        ttk.Button(frm, text='浏览…', command=lambda: self.pick(self.var_base, 'pdf')).grid(row=1, column=2, **pad)
+
+        # 锚定原稿/客户指示稿
+        self.lbl_anchor = ttk.Label(frm, text='客户锚定原稿 (可选):')
+        self.lbl_anchor.grid(row=2, column=0, sticky='w', **pad)
         self.var_anchor = tk.StringVar()
-        tk.Entry(frm, textvariable=self.var_anchor).grid(row=1, column=1, sticky='ew', **pad)
-        ttk.Button(frm, text='浏览…', command=lambda: self.pick(self.var_anchor, 'pdf')).grid(row=1, column=2, **pad)
+        tk.Entry(frm, textvariable=self.var_anchor).grid(row=2, column=1, sticky='ew', **pad)
+        ttk.Button(frm, text='浏览…', command=lambda: self.pick(self.var_anchor, 'pdf')).grid(row=2, column=2, **pad)
 
         # 多国语文件夹
-        ttk.Label(frm, text='多国语PDF文件夹:').grid(row=2, column=0, sticky='w', **pad)
+        ttk.Label(frm, text='多国语PDF文件夹:').grid(row=3, column=0, sticky='w', **pad)
         self.var_dir = tk.StringVar()
-        tk.Entry(frm, textvariable=self.var_dir).grid(row=2, column=1, sticky='ew', **pad)
-        ttk.Button(frm, text='浏览…', command=lambda: self.pick(self.var_dir, 'dir')).grid(row=2, column=2, **pad)
+        tk.Entry(frm, textvariable=self.var_dir).grid(row=3, column=1, sticky='ew', **pad)
+        ttk.Button(frm, text='浏览…', command=lambda: self.pick(self.var_dir, 'dir')).grid(row=3, column=2, **pad)
 
         frm.columnconfigure(1, weight=1)
 
@@ -80,6 +92,16 @@ class GUIApp:
         self.root.after(100, self.pump)
 
     # ---------- 控件 ----------
+    def on_mode_change(self, _evt=None):
+        if self.var_mode.get() == 'highlight':
+            self.lbl_base.config(text='英文指示稿 (高亮模式不需要):')
+            self.lbl_anchor.config(text='客户指示稿 (红框+高亮, 必填):')
+            self.lbl_mode.config(text='高亮模式: 只校红框内青色高亮内容(数字/型号/参数)', foreground='#1a7f37')
+        else:
+            self.lbl_base.config(text='英文指示稿 (红字标注版):')
+            self.lbl_anchor.config(text='客户锚定原稿 (可选):')
+            self.lbl_mode.config(text='红字模式: 校全部红字数字', foreground='#0969da')
+
     def pick(self, var: tk.StringVar, kind: str):
         if kind == 'pdf':
             path = filedialog.askopenfilename(
@@ -99,15 +121,21 @@ class GUIApp:
     def on_run(self):
         if self.busy:
             return
+        mode = self.var_mode.get()
         base = self.var_base.get().strip()
         anchor = self.var_anchor.get().strip() or None
         data_dir = self.var_dir.get().strip()
-        if not base or not os.path.isfile(base):
-            messagebox.showerror(APP_TITLE, '请选择存在的英文指示稿 PDF')
-            return
-        if anchor and not os.path.isfile(anchor):
-            messagebox.showerror(APP_TITLE, '锚定原稿不存在, 请重新选择')
-            return
+        if mode == 'highlight':
+            if not anchor or not os.path.isfile(anchor):
+                messagebox.showerror(APP_TITLE, '高亮模式请选择存在的客户指示稿(红框+高亮) PDF')
+                return
+        else:
+            if not base or not os.path.isfile(base):
+                messagebox.showerror(APP_TITLE, '请选择存在的英文指示稿 PDF')
+                return
+            if anchor and not os.path.isfile(anchor):
+                messagebox.showerror(APP_TITLE, '锚定原稿不存在, 请重新选择')
+                return
         if not data_dir or not os.path.isdir(data_dir):
             messagebox.showerror(APP_TITLE, '请选择存在的多国语 PDF 文件夹')
             return
@@ -116,14 +144,17 @@ class GUIApp:
         self.btn_run.config(state='disabled', text='处理中…')
         self.prog.start(12)
         self.set_log_text('')
-        t = threading.Thread(target=self._worker, args=(base, anchor, data_dir), daemon=True)
+        t = threading.Thread(target=self._worker, args=(mode, base, anchor, data_dir), daemon=True)
         t.start()
 
-    def _worker(self, base, anchor, data_dir):
+    def _worker(self, mode, base, anchor, data_dir):
         try:
             def logf(msg, end='\n'):
                 self.log(str(msg), '')
-            paths = mee_checker.run_job(base, anchor, data_dir, None, log=logf)
+            if mode == 'highlight':
+                paths = mee_checker.run_highlight_job(anchor, data_dir, None, log=logf)
+            else:
+                paths = mee_checker.run_job(base, anchor, data_dir, None, log=logf)
             self.done(True, paths)
         except Exception as e:
             import traceback
@@ -168,10 +199,13 @@ class GUIApp:
             report_html = paths[1]
             self.log(f'\n✓ 校对完成! 输出目录: {out_dir}', 'ok')
             self.log(f'  报告: {paths[0]}', 'ok')
-            self.log(f'  HTML: {report_html}', 'ok')
+            if report_html:
+                self.log(f'  HTML: {report_html}', 'ok')
+            else:
+                self.log('  (高亮模式: 打开 xlsx 与高亮清单.csv 核对提取范围)', 'info')
             self.log(f'  截图: {paths[2]}', 'info')
             self.out_paths = paths
-            if self.chk_open.get() and os.path.exists(report_html):
+            if self.chk_open.get() and report_html and os.path.exists(report_html):
                 try:
                     import webbrowser
                     webbrowser.open('file:///' + os.path.abspath(report_html).replace('\\', '/'))
