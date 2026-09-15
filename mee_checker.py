@@ -49,6 +49,9 @@ REJECT_COST = 70.0     # 分配代价超过此值不成立 -> 未匹配
 CONF_DY_HIGH = 15.0    # 值相同且 Δy<=此值 -> high
 CONF_DY_MED = 12.0     # 值不同但 Δy<=此值 -> medium(真实差异典型形态)
 W_X = 0.5              # x 偏移代价权重
+W_X_SAME = 0.3         # 值相同候选对的 x 权重: 图形/文本重排常致大幅水平位移,
+                       # 垂直位置才是主判据(否则同值对因 dx 超阈被拆散, 反配邻近异值项);
+                       # 0.3 可救回 dx~200pt 级重排, 仍拒绝 dx>330pt 的疑似错配
 REWARD_SAME = -30.0    # 值相同奖励(负代价)
 PENALTY_DIFF = 35.0    # 值不同惩罚(允许真实差异, 但需位置强吻合)
 PENALTY_TOK = 35.0     # 数字个数不同惩罚
@@ -209,6 +212,10 @@ def _cluster_spans(pno: int, spans: list, others: list) -> list[Item]:
                             break
                     if dot:
                         text += dot
+                    elif gap > 0.5 and prev["text"].rstrip()[-1:].isdigit() and sp["text"].lstrip()[:1].isdigit():
+                        # 数字边界: 两个独立数字不得直接连写(如相邻竖列 390|330 误粘成 390330,
+                        # 双语粘不粘不对称 -> 假"真缺失"高风险), 必须插空格分 token
+                        text += " "
                     else:
                         text += "" if gap < JOIN_GAP else " "
                 text += sp["text"].strip()
@@ -378,7 +385,11 @@ def extract_items(doc: fitz.Document, color_counter: Counter | None = None) -> l
                     continue
                 t = sp["text"].strip()
                 prev_txt = row[i - 1][0]["text"].strip() if i > 0 else ''
-                is_footnote = (prev_txt.endswith('*') and re.fullmatch(r'\d{1,3}', t) is not None)
+                # 脚注索引必须紧邻星号词(gap≤3pt, 实测真脚注 gap≈0);
+                # 同行远处的红数字(如图形尺寸 350, gap 50+pt)是检查点, 不得误杀
+                near_prev = (i > 0 and sp["bbox"][0] - row[i - 1][0]["bbox"][2] <= 3.0)
+                is_footnote = (near_prev and prev_txt.endswith('*')
+                               and re.fullmatch(r'\d{1,3}', t) is not None)
                 if is_footnote:
                     continue
                 # 上标字符(²/³/¹/ⁿ): 单位的一部分(如 kgf/cm²), 非独立数字, 不作为检查点
@@ -495,7 +506,7 @@ def match_page(en_items: list[Item], xx_items: list[Item], page1: int) -> list[P
     """单页匹配: 页级偏移估计 -> 统一匈牙利全局最优分配 -> 邻域插值二级匹配
 
     设计要点:
-    - 所有检查点统一参与全局分配, 不硬锁定锚点; "缺失"以 COST_BIG 表达,
+    - 所有检查点统一参与全局分配, 不硬锁定锚点; "放弃分配"以 REJECT_COST 边表达(分配后丢弃),
       同值多点时全局最优会自动把候选让给位置最吻合的一方, 避免贪心抢占张冠李戴;
     - 值不同不阻断匹配(否则真实差异会漏配), 但要求位置强吻合;
     - 一级拒绝后进入二级匹配: 用已配对的上下邻居插值期望位置,
@@ -582,7 +593,10 @@ def match_page(en_items: list[Item], xx_items: list[Item], page1: int) -> list[P
     free_xx = [j for j in range(m) if j not in locked_xx]
     if free_en and free_xx:
         fe, fx = len(free_en), len(free_xx)
-        cost_f = [[COST_BIG] * fx for _ in range(fe)]
+        # 剪枝边/超阈边统一用 REJECT_COST 占位: 分配后 >=REJECT_COST 一律丢弃,
+        # 等价于"放弃分配"。若用 COST_BIG 占位, 匈牙利为避开 1e6 会优先牺牲
+        # 同样被丢弃的 70+ 边, 扭曲全局最优(如把 -21.5 的同值项让给垃圾分配)。
+        cost_f = [[REJECT_COST] * fx for _ in range(fe)]
         for a, i in enumerate(free_en):
             for b, j in enumerate(free_xx):
                 e, x = en_items[i], xx_items[j]
@@ -593,14 +607,14 @@ def match_page(en_items: list[Item], xx_items: list[Item], page1: int) -> list[P
                 pdx = PRUNE_DX_SAME if same else prune_dx
                 if dy > pdy or dx > pdx:
                     continue
-                c = dy + W_X * dx + (REWARD_SAME if same else
+                c = dy + (W_X_SAME if same else W_X) * dx + (REWARD_SAME if same else
                                      (PENALTY_TOK if token_count(e.text) != token_count(x.text)
                                       else PENALTY_DIFF))
                 if e.left_ctx and x.left_ctx and e.left_ctx.lower() == x.left_ctx.lower():
                     c -= REWARD_CTX
                 if e.right_ctx and x.right_ctx and e.right_ctx.lower() == x.right_ctx.lower():
                     c -= REWARD_CTX
-                cost_f[a][b] = c
+                cost_f[a][b] = min(c, REJECT_COST)
         ri, cj = _hungarian(cost_f)
         for a, b in zip(ri, cj):
             if cost_f[a][b] >= REJECT_COST or cost_f[a][b] >= COST_BIG:
@@ -608,6 +622,7 @@ def match_page(en_items: list[Item], xx_items: list[Item], page1: int) -> list[P
             i, j = free_en[a], free_xx[b]
             e, x = en_items[i], xx_items[j]
             dy = abs((x.yc - e.yc) - y_med)
+            dx = abs((x.xc - e.xc) - x_med)   # 必须重算: 否则会泄漏矩阵构建循环的残留 dx
             same = value_same(e.text, x.text)
             if same:
                 conf = 'high' if dy <= CONF_DY_HIGH else 'medium'
@@ -616,6 +631,10 @@ def match_page(en_items: list[Item], xx_items: list[Item], page1: int) -> list[P
             else:
                 conf = 'low'
             status, note = compare(e.text, x.text)
+            if same and status == '一致' and dy + W_X * dx + REWARD_SAME >= REJECT_COST:
+                # 旧代价本会被拒绝、因同值降 dx 权重才配上的对: 位移异常大,
+                # 保留大位移抽查档(finalize 转低风险), 不静默绿掉
+                note = (note + '; ' if note else '') + f'大位移(一级配对): y偏差{dy:.0f}pt x偏差{dx:.0f}pt, 抽查项'
             if conf == 'low':
                 note = (note + '; ' if note else '') + '低置信匹配, 建议核对坐标'
             pairs.append(Pair(cp='', page=page1, en=e, xx=x,
@@ -784,6 +803,35 @@ def resolve_aggregation(pairs: list[Pair], xx_items: list | None = None):
     方向二(英文聚合/译文拆散): 待人工项英文token>译文token, 残为多出邻项。
     四条件(全过才合并): 同页; 数字个数不等; 差值token与残项token完全一致(多集差);
     位置邻近(<40pt)且残项唯一。任一不满足保持原状态(转人工), 不动摇底线。"""
+    # 第零遍: 已配对但译文粘连注释标号前缀(如竖排上标 8 + 102 -> '8 102'):
+    # 译文 tokens = 1~2位纯数字前缀 + 英文值完整后缀, 且 dy≤25 -> 判一致并备注。
+    # 必须跑在方向一/二之前: 否则前缀会被当成邻项数字卷入聚合合并,
+    # 把同页真正的邻项检查点误标"已并入"而掩掉它的独立问题。
+    for p in pairs:
+        if p.en is None or p.xx is None or p.status not in ('待人工', '不一致'):
+            continue
+        et = TOKEN_RE.findall(p.en.text)
+        xt = TOKEN_RE.findall(p.xx.text)
+        if not et or len(xt) <= len(et) or len(xt) - len(et) > 2:
+            continue
+        if abs(p.xx.yc - p.en.yc) > 25:
+            continue
+        for dh in range(1, len(xt) - len(et) + 1):
+            pre = xt[:dh]
+            if xt[dh:] != et or not all(re.fullmatch(r'\d{1,2}', t) for t in pre):
+                continue
+            # 守卫: 前缀值须在同页其它译文项里另有出现 -> 才是冗余注释标号;
+            # 若同页再无此值, 前缀更可能是邻项检查点的真数字(真聚合), 交方向一/二。
+            redundant = any(
+                it is not p.xx and it.page == p.xx.page
+                and any(_num_eq(v, t) for v in pre for t in TOKEN_RE.findall(it.text))
+                for it in (xx_items or []))
+            if not redundant:
+                continue
+            p.status = '一致'
+            p.note = (f"译文值含额外注释标号前缀 {' '.join(pre)}(疑注释编号粘连), "
+                      f"数值 {p.en.text} 与译文一致; 建议人工过一眼")
+            break
     by_page: dict[int, list[Pair]] = {}
     for p in pairs:
         by_page.setdefault(p.page, []).append(p)
@@ -995,6 +1043,27 @@ def snap(doc: fitz.Document, pno: int, bbox, path: str):
     pix = page.get_pixmap(clip=r, dpi=SNAP_DPI)
     pix.save(path)
 
+
+def snap_marked(page, clip, rect, path):
+    """截图并在 rect 处叠黄底红框(与复核 PDF 同色同语义), 供期望位置/同位置参考截图.
+    框烘焙进 PNG: HTML 与 Excel 共用, 位置由 clip 坐标换算保证精确."""
+    pix = page.get_pixmap(clip=clip, dpi=SNAP_DPI)
+    try:
+        import io
+        from PIL import Image, ImageDraw
+        img = Image.open(io.BytesIO(pix.tobytes('png'))).convert('RGBA')
+        z = SNAP_DPI / 72.0   # PDF pt -> 像素缩放
+        box = ((rect.x0 - clip.x0) * z, (rect.y0 - clip.y0) * z,
+               (rect.x1 - clip.x0) * z, (rect.y1 - clip.y0) * z)
+        ov = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        d = ImageDraw.Draw(ov)
+        d.rectangle(box, fill=(255, 235, 59, 100), outline=(207, 33, 46, 255), width=3)
+        img = Image.alpha_composite(img, ov).convert('RGB')
+        img.save(path, 'PNG')
+    except Exception:
+        pix.save(path)   # PIL 异常降级为无框截图
+
+
 # ---------------- Excel 报告 ----------------
 FILL = {
     '高风险':   PatternFill('solid', fgColor='C00000'),
@@ -1050,7 +1119,11 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
             tot[k] += cnt[k]
         tot_sp += r['n_sp']
         problems = cnt['高风险'] + cnt['中风险']
-        concl = '✓ 通过' if problems == 0 else f'⚠ 需人工({problems}项)'
+        _off = r.get('offbox', 0)
+        concl = ('✓ 通过' if problems == 0 else
+                 f'必办{cnt["高风险"]} · 复核{cnt["中风险"]}'
+                 + (f' · 抽查{cnt["低风险"]}' if cnt['低风险'] else '')
+                 + (f' · 框外差异{_off}' if _off else ''))
         ws.append([r['file'], r['lang'], len(en_items), r['n_xx'],
                    cnt['一致'], r['n_sp'], cnt['中风险'], cnt['高风险'], concl])
         if problems:
@@ -1075,10 +1148,13 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
             en_v = p.en.text if p.en else ''
             xx_v = p.xx.text if p.xx else ''
             has_snap = p.status != '一致' and p.status not in IGNORED_STATUSES
-            se = os.path.join('snaps', r['lang'], f"{p.cp or 'XX'}_{r['lang']}_EN.png") if p.en and has_snap else ''
-            sx = os.path.join('snaps', r['lang'], f"{p.cp or 'XX'}_{r['lang']}_XX.png") if p.xx and has_snap else ''
-            sx2 = os.path.join('snaps', r['lang'], f"{p.cp or 'XX'}_{r['lang']}_XX@期望位置.png") \
-                if (p.xx is None and p.expect_y is not None) else ''
+            stag = _snap_tag(p)   # 与实际存图名对齐(多出项是 XX@页~y, 非 'XX')
+            se = os.path.join('snaps', r['lang'], f"{stag}_{r['lang']}_EN.png") if p.en and has_snap else ''
+            if not se and p.en is None and p.xx is not None and has_snap:
+                se = os.path.join('snaps', r['lang'], f"{stag}_{r['lang']}_EN@同位置参考.png")
+            sx = os.path.join('snaps', r['lang'], f"{stag}_{r['lang']}_XX.png") if p.xx and has_snap else ''
+            sx2 = os.path.join('snaps', r['lang'], f"{stag}_{r['lang']}_XX@期望位置.png") \
+                if (has_snap and p.xx is None and p.expect_y is not None) else ''
             ws.append([r['lang'], r['file'], p.cp, p.page, p.status, p.conf,
                        en_v, xx_v, p.y_off if p.y_off is not None else '', p.note, se, sx or sx2])
             cell = ws.cell(row=ws.max_row, column=5)
@@ -1192,12 +1268,13 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
         ['检查点编号', 'P{页码}-{页内序号}, 以英文指示稿为准, 全语言统一'],
         [''],
         ['状态定义(风险分级)'],
+        ['使用建议', '默认只看高风险(必办); 中/低风险仅在时间允许时浏览——中/低均为"值级可对账、仅布局/位置差异"项, 跳过不丢真错(框外差异除外, 见下)'],
         ['一致', '能确认对应且数值等价, 无风险(绿)'],
-        ['低风险', '大位移确认: 值相同但译排版重排导致红字大幅移动, 由上下邻居插值+唯一候选+偏差达标确认; 抽查项(蓝)'],
-        ['中风险', '无法确认对应(可能串位/聚合/跨页位移/图内), 保守转人工; 黄色, 建议核对'],
-        ['高风险', '确认对应但数值不同(真差异), 或值在对面完全不存在(真缺失/多余); 红色, 必须处理'],
+        ['低风险', '大位移确认: 值相同但译排版重排导致红字大幅移动; 抽查项(蓝)'],
+        ['中风险', '无法确认对应(可能串位/聚合/跨页位移/图内), 保守转人工; 黄色, 建议核对。串位/聚合/图内降档均要求差值在页内可对账(值未丢失), 仅布局变化'],
+        ['高风险', '值级不可对账必报: 确认对应但数值不同(真差异), 或值在对面完全不存在(真缺失/多余); 图内红字若值在页内不存在也判高风险; 红色, 必须处理'],
         ['已并入聚合差异', '聚合/锚定合并后的原项, 不重复计为问题 (灰色, 供追溯)'],
-        ['非锚定区(忽略)', '不在客户红框内, 非校对对象 (灰, 不统计)'],
+        ['非锚定区(忽略)', '不在客户红框内, 非校对对象 (灰, 不统计); 若框外两侧已配对且值不同, 备注标"框外值差异"留痕并在汇总/页头计数'],
         ['目录条目(不校对)', '点线目录行的章节号/页码, 页码随各语言重排可变, 不作数值校对 (灰, 不统计, 备注留差异)'],
         [''],
         ['自动判定底线'],
@@ -1319,8 +1396,12 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
             return ''
         tag = _snap_tag(p)
         if kind == 'EN':
-            f = os.path.join(snaps_dir, lang, f'{tag}_{lang}_EN.png')
-            cap = f'英文指示稿 · 值 {_h.escape(p.en.text)}' if p.en else '英文指示稿'
+            if p.en is not None:
+                f = os.path.join(snaps_dir, lang, f'{tag}_{lang}_EN.png')
+                cap = f'英文指示稿 · 值 {_h.escape(p.en.text)}'
+            else:
+                f = os.path.join(snaps_dir, lang, f'{tag}_{lang}_EN@同位置参考.png')
+                cap = '英文指示稿 · 同位置参考(无对应红字)'
         elif kind == 'XX' and p.xx is not None:
             f = os.path.join(snaps_dir, lang, f'{tag}_{lang}_XX.png')
             cap = f'{LANG_NAMES.get(lang, lang)} · 值 {_h.escape(p.xx.text)}'
@@ -1328,12 +1409,21 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
             f = os.path.join(snaps_dir, lang, f'{tag}_{lang}_XX@期望位置.png')
             cap = f'{LANG_NAMES.get(lang, lang)} · 期望位置(未找到红字)'
         img = _b64(f)
+        if img is None:
+            # 缺图占位, 不再渲染 src="None" 碎图
+            return (f'<figure><img class="missing" alt="截图缺失">'
+                    f'<figcaption>{cap} · 截图缺失</figcaption></figure>')
         # 需人工确认项可点击打开定位 PDF(每问题一页, 打开即定位)
         need_review = p.status not in ('一致',) + IGNORED_STATUSES
         if need_review:
-            if kind == 'EN' and p.en is not None:
-                pg = p.en_locate_page or (p.en.page + 1)
-                href = f'复核PDF/EN.pdf#page={pg}'   # 英文截图 -> 英文定位 PDF
+            href = None
+            if kind == 'EN':
+                if p.en is not None:
+                    pg = p.en_locate_page or (p.en.page + 1)
+                    href = f'复核PDF/EN.pdf#page={pg}'   # 英文截图 -> 英文定位 PDF
+                elif p.en_locate_page:
+                    pg = p.en_locate_page
+                    href = f'复核PDF/EN.pdf#page={pg}'   # 多出项英文侧 -> 英文稿同位置参考页
             elif p.xx is not None:
                 pg = p.locate_page or (p.xx.page + 1)
                 href = f'复核PDF/{lang}.pdf#page={pg}'  # 译文截图 -> 对应语言定位 PDF
@@ -1343,7 +1433,9 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
             inner = (f'<figure class="linkable" style="cursor:pointer" '
                      f'title="点击打开定位PDF(定位页{pg})"><img src="{img}">'
                      f'<figcaption>{cap} · 点击定位</figcaption></figure>')
-            return f'<a href="{href}" target="_blank">{inner}</a>'
+            if href:
+                return f'<a href="{href}" target="_blank">{inner}</a>'
+            return inner
         return f'<figure><img src="{img}"><figcaption>{cap}</figcaption></figure>'
 
     parts = [
@@ -1362,6 +1454,9 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
         f'<div class="stat"><b>{len(en_items)}×{len(results)}</b><span>检查点总数</span></div>',
         '</div>',
     ]
+    _off_total = sum(r.get('offbox', 0) for r in results)
+    if _off_total:
+        parts.insert(-1, f'<div class="stat"><b>{_off_total}</b><span>框外值差异(不计入,明细留痕)</span></div>')
 
     # 筛选按钮(按风险颜色)
     btns = [('all', '全部', '', sum(cnt.values()))]
@@ -1381,8 +1476,15 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
         probs = [p for p in r['pairs'] if p.status not in ('一致',) + IGNORED_STATUSES]
         sps = []
         problems = len(probs)
-        concl = '✓ 通过' if problems == 0 else f'⚠ 需人工({problems}项)'
-        bcolor = '#1a7f37' if problems == 0 else '#bf8700'
+        nh = sum(1 for p in probs if p.status == '高风险')
+        nm = sum(1 for p in probs if p.status == '中风险')
+        nl = problems - nh - nm
+        _off = r.get('offbox', 0)
+        concl = ('✓ 通过' if nh + nm == 0 else
+                 f'必办{nh} · 复核{nm}'
+                 + (f' · 抽查{nl}' if nl else '')
+                 + (f' · 框外差异{_off}' if _off else ''))
+        bcolor = '#1a7f37' if nh + nm == 0 else ('#cf222e' if nh else '#bf8700')
         parts.append(f'<section class="lang" id="lang-{lang}"><h2>'
                      f'{lname} <span class="fname">{_h.escape(r["file"])} · 检查点{len(en_items)} '
                      f'· 一致{len(en_items) - problems}</span>'
@@ -1432,6 +1534,10 @@ function setFilter(f){
     b.classList.toggle('active',b.dataset.f===f);
   });
 }
+// 默认只看高风险(存在时); 中/低/框外靠筛选按钮切换浏览
+window.addEventListener('DOMContentLoaded',function(){
+  if(document.querySelector('.item[data-status="高风险"]'))setFilter('高风险');
+});
 """
 
 
@@ -1653,12 +1759,18 @@ def finalize_statuses(pairs: list, en_items: list, xx_items: list) -> int:
             continue
         if p.status in IGNORED_STATUSES or p.status == '一致':
             continue
-        # 图内红字(图注/箭头/分数标记)受图重排影响大, 一律保守归需复核, 不判不一致
+        # 图内红字(图注/箭头/分数标记): 仅当英文值在译文同页可对账(位置失真型串位)才降需复核;
+        # 值在页内根本不存在 = 真差异/真缺失, 图内也保持不一致(高风险必报)
         if p.en is not None and is_figure_red(p.en.text, p.en.left_ctx, p.en.right_ctx):
-            p.status = '需复核'
-            p.note = '需复核(图内红字,图重排易致位置失真): ' + p.note
-            changed += 1
-            continue
+            vals = TOKEN_RE.findall(p.en.text)
+            others = [it for it in xx_items if it.page == p.en.page
+                      and (p.xx is None or it is not p.xx)]
+            if vals and all(any(_num_eq(v, t) for it in others for t in TOKEN_RE.findall(it.text))
+                            for v in vals):
+                p.status = '需复核'
+                p.note = '需复核(图内红字,值在页内可对账,图重排位置失真): ' + p.note
+                changed += 1
+                continue
         if p.status == '不一致':
             # 值确认不同 -> 保留不一致(即使低置信, 值不同是事实; 低置信仅表示位置存疑需人工复核坐标)
             continue
@@ -1939,6 +2051,7 @@ def run_job(base, anchor, data_dir, out=None, log=print):
     color_notes = []   # 非标准红提示
     review_dir = os.path.join(out_dir, '复核PDF')
     en_marks: dict = {}   # 英文侧标注: (page,yc,x0) -> {bbox, langs}
+    en_orphans: list = []  # 译文多出项: (lang, pair) -> 也入英文定位 PDF(同位置参考页)
     en_sorted_page = {}
     for it in en_sorted:
         en_sorted_page.setdefault(it.page, []).append(it)
@@ -1955,12 +2068,21 @@ def run_job(base, anchor, data_dir, out=None, log=print):
             if p.en is not None:
                 lst = en_sorted_page[p.en.page]
                 p.cp = f'P{p.en.page + 1}-{lst.index(p.en) + 1}'
+        offbox = 0   # 框外值差异计数(不计入问题, 仅留痕供参考)
         if anchor_zones:
             # 锚定模式: 英文检查点不在红框内 -> 非锚定区(忽略, 不入选统计/截图/报告)
             for p in pairs:
                 if p.en is not None and not in_anchor(p.en, anchor_zones):
                     p.status = '非锚定区(忽略)'
                     p.note = '非锚定区: 英文检查点不在客户红框内'
+                    if p.xx is not None:
+                        # 只统计 token 数相等且逐位值不等的对(真值差异);
+                        # token 数不等的是粘连/拆分粒度差异(值在页内可寻), 不算框外差异
+                        et = TOKEN_RE.findall(p.en.text)
+                        xt = TOKEN_RE.findall(p.xx.text)
+                        if et and len(et) == len(xt) and any(not _num_eq(a, b) for a, b in zip(et, xt)):
+                            p.note += f'; 框外值差异: {p.en.text} → {p.xx.text}(非校对对象, 不计入)'
+                            offbox += 1
             # 译文孤儿(多出/未匹配): 其译文项不在任何红框内(x+y 全判) -> 非锚定区, 忽略
             for p in pairs:
                 if p.status in ('译文多出', '译文未匹配'):
@@ -1986,7 +2108,8 @@ def run_job(base, anchor, data_dir, out=None, log=print):
         if odd:
             color_notes.append(f'{lang}: 检测到非英文稿主色的红系颜色 {odd}, 已一并提取, 建议与标注方确认规范')
         results.append({'file': fname, 'lang': lang, 'pairs': pairs,
-                        'n_xx': len(xx_items), 'n_sp': 0, 'doc': doc, 'path': path, 'cc': cc})
+                        'n_xx': len(xx_items), 'n_sp': 0, 'doc': doc, 'path': path, 'cc': cc,
+                        'offbox': offbox})
 
     # 跨语言交叉验证聚合差异(在截图/统计前, 影响最终状态)
     n_cross = cross_validate_aggregation(results)
@@ -2019,16 +2142,35 @@ def run_job(base, anchor, data_dir, out=None, log=print):
                      os.path.join(lang_snap, f'{tag}_{lang}_XX.png'))
                 n_snaps += 1
             elif p.xx is None and p.expect_y is not None and p.en is not None:
-                # 译文侧期望位置截图(缺失处上下文)
+                # 译文侧期望位置截图(缺失处上下文): 黄框标出推断的期望位置, 窗口外扩留可辨认上下文
                 e = p.en
                 cx = (e.bbox[0] + e.bbox[2]) / 2 + (p.expect_dx or 0.0)
                 hh = max(e.bbox[3] - e.bbox[1], 10.0)
                 page = doc[e.page]
-                r2 = fitz.Rect(cx - 50, p.expect_y - hh / 2 - 14,
-                                cx + 50, p.expect_y + hh / 2 + 14) & page.rect
+                mark = fitz.Rect(cx - 45, p.expect_y - hh / 2 - 8,
+                                 cx + 45, p.expect_y + hh / 2 + 8)
+                r2 = fitz.Rect(mark.x0 - 25, mark.y0 - 25,
+                               mark.x1 + 25, mark.y1 + 25) & page.rect
+                mark = mark & page.rect
                 if r2.width > 2 and r2.height > 2:
-                    page.get_pixmap(clip=r2, dpi=SNAP_DPI).save(
-                        os.path.join(lang_snap, f'{tag}_{lang}_XX@期望位置.png'))
+                    snap_marked(page, r2, mark,
+                                os.path.join(lang_snap, f'{tag}_{lang}_XX@期望位置.png'))
+                    n_snaps += 1
+            if p.en is None and p.xx is not None:
+                # 译文多出: 英文稿同页同位置取参考截图(双语页码基本对齐),
+                # 供人工看"英文稿这个位置是什么", 与译文侧"期望位置"截图对称; 黄框标出参考区域
+                x = p.xx
+                ep = min(x.page, en_doc.page_count - 1)
+                cx = (x.bbox[0] + x.bbox[2]) / 2
+                hh = max(x.bbox[3] - x.bbox[1], 10.0)
+                page = en_doc[ep]
+                mark = fitz.Rect(cx - 45, x.yc - hh / 2 - 8, cx + 45, x.yc + hh / 2 + 8)
+                r2 = fitz.Rect(mark.x0 - 25, mark.y0 - 25,
+                               mark.x1 + 25, mark.y1 + 25) & page.rect
+                mark = mark & page.rect
+                if r2.width > 2 and r2.height > 2:
+                    snap_marked(page, r2, mark,
+                                os.path.join(lang_snap, f'{tag}_{lang}_EN@同位置参考.png'))
                     n_snaps += 1
         problems = sum(1 for p in pairs if p.status != '一致' and p.status not in IGNORED_STATUSES)
         n_sp = sum(1 for p in pairs if p.status == '低风险')
@@ -2070,8 +2212,13 @@ def run_job(base, anchor, data_dir, out=None, log=print):
             key = (p.en.page, round(p.en.yc, 1), round(p.en.bbox[0], 1))
             en_marks.setdefault(key, {'bbox': p.en.bbox, 'langs': set()})
             en_marks[key]['langs'].add(lang)
+        # 译文多出项: 收集供英文定位 PDF 加页(点击英文侧不再错跳译文 PDF)
+        for p in pairs:
+            if p.en is None and p.xx is not None \
+                    and p.status not in ('一致',) + IGNORED_STATUSES:
+                en_orphans.append((lang, p))
         log(f'  [{lang}] {fname}: 检查点{len(en_items)} 译文红字{r["n_xx"]} '
-              f'问题项{problems} 低风险{n_sp} (截图{n_snaps}张 定位PDF{len(loc_rows)}页)')
+              f'问题项{problems} 低风险{n_sp} 框外差异{offbox} (截图{n_snaps}张 定位PDF{len(loc_rows)}页)')
         doc.close()
 
     # 英文指示稿定位 PDF: 每个问题检查点独占一页
@@ -2081,6 +2228,17 @@ def run_job(base, anchor, data_dir, out=None, log=print):
         langs = ','.join(sorted(info['langs']))
         en_rows.append([page0, info['bbox'], f'英文指示稿 · {page0 + 1}页 · 问题语言: {langs}', []])
         info['page_no'] = len(en_rows)          # 该检查点在 EN 定位 PDF 中的页码
+    # 译文多出项: 英文稿同位置参考页(矩形取译文项坐标映射到英文页, 页码基本对齐)
+    for lang, p in en_orphans:
+        x = p.xx
+        page0 = min(x.page, en_doc.page_count - 1)
+        cx = (x.bbox[0] + x.bbox[2]) / 2
+        hh = max(x.bbox[3] - x.bbox[1], 10.0)
+        rect = (cx - 45, x.yc - hh / 2 - 8, cx + 45, x.yc + hh / 2 + 8)
+        en_rows.append([page0, rect,
+                        f'英文指示稿 · {page0 + 1}页 · {lang} 译文多出(英文无对应红字)',
+                        [f'译文值: {x.text}    备注: {p.note[:80]}']])
+        p.en_locate_page = len(en_rows)
     # 回填每条问题的英文侧定位页码
     for r in results:
         for p in r['pairs']:

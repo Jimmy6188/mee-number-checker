@@ -6,11 +6,11 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['PIL', 'PIL.Image', 'PIL.ImageDraw'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['scipy', 'pandas', 'PIL', 'matplotlib', 'numpy', 'lxml', 'cryptography', 'IPython', 'pytest'],
+    excludes=['scipy', 'pandas', 'matplotlib', 'numpy', 'lxml', 'cryptography', 'IPython', 'pytest'],
     noarchive=False,
     optimize=0,
 )
