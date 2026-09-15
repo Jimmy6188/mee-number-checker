@@ -2253,7 +2253,7 @@ def _hl_line_hit(ntext: str, key_groups: list, loose: bool, all_tokens: bool = F
 def hl_find_in_lines(item, pages: dict, pno0: int, y_off: float = 0.0, page_off: int = 0):
     """在译文页行集中找高亮内容: 同页优先、邻近页次之, 多命中取 y 最近(行带按页偏移 y_off 校准).
     字符串类(code/ord)严格未中时允许子串兜底; 序号类强制行带±40(无位置约束的'(1)'无意义).
-    返回 (page0, yc, 命中键, 行文本) 或 None"""
+    返回 (page0, yc, 命中键, 行文本, 行x0, 行x1) 或 None"""
     keys = hl_keys(item)
     if not keys:
         return None
@@ -2270,13 +2270,13 @@ def hl_find_in_lines(item, pages: dict, pno0: int, y_off: float = 0.0, page_off:
                 if item.hl_type == 'ord' and abs(yc - item.yc - y_off) > 40:
                     continue
                 if _hl_line_hit(ntext, keys, mode == 'loose', all_tok):
-                    cands.append((p, yc, keys[0], raw))
+                    cands.append((p, yc, keys[0], raw, x0, x1))
         if cands:
             cands.sort(key=lambda c: (abs(c[0] - item.page), abs(c[1] - item.yc - y_off)))
             return cands[0]
     if enum_code_fallback(item, keys, pages, order, y_off):
         p = order[0]
-        return (p, item.yc + y_off, keys[0], '枚举型号跨行断词: 各 token 同页分别命中')
+        return (p, item.yc + y_off, keys[0], '枚举型号跨行断词: 各 token 同页分别命中', None, None)
     # 断词连行兜底: 型号被行断 'MXZ-' / '2HB50VF)' → 相邻行拼接后查找
     if item.hl_type == 'code':
         for g in keys:
@@ -2289,7 +2289,7 @@ def hl_find_in_lines(item, pages: dict, pno0: int, y_off: float = 0.0, page_off:
                         # 下行开头接上行结尾(去空格变体)
                         joined = ra.rstrip() + rb.lstrip()
                         if any(x in joined.replace(' ', '') for x in g):
-                            return (p, ya, keys[0], f'型号跨行断词命中: {joined[:40]}')
+                            return (p, ya, keys[0], f'型号跨行断词命中: {joined[:40]}', None, None)
     return None
 
 
@@ -2342,31 +2342,60 @@ def hl_page_offset(items, pages, pno0_map=None):
 
 
 def hl_compare_lang(item, pages: dict, y_off: float = 0.0, page_off: int = 0) -> tuple:
-    """单语言比对一个高亮检查点 -> (status, conf, xx_repr, note)
+    """单语言比对一个高亮检查点 -> (status, conf, hit, note)
+    hit = (page0, yc, x0, x1, 行文本) 或 None(供截图/定位)
     行带 = 英文 yc + 页级偏移 y_off ± 40(校准后真正的"同位置");
       行带内命中             -> 一致(≤20 high, 否则 medium)
       同页行带外/跨页命中    -> 中风险(疑串位/错印后在他处出现)
       全册未找到             -> 高风险(真缺失)"""
     hit = hl_find_in_lines(item, pages, item.page, y_off=y_off, page_off=page_off)
     if hit:
-        p, yc, key, raw = hit
+        p, yc, key, raw, lx0, lx1 = hit
+        if isinstance(key, frozenset):   # 变体组: 取最短(原始形态)供截图黄框定位
+            key = min(key, key=len)
         yoff = round(yc - item.yc - y_off, 1)
         if item.hl_type == 'toc':
             # 目录页码/脚注枚举: 全册任意页命中即一致(位置随重排不稳, 页级无意义)
-            return '一致', 'medium', raw, f'目录/脚注枚举命中(仅全册值校验): {item.text} (译文页{p + 1})'
+            return '一致', 'medium', (p, yc, lx0, lx1, raw, key), f'目录/脚注枚举命中(仅全册值校验): {item.text} (译文页{p + 1})'
         if p == item.page + page_off and abs(yoff) <= 20:
-            return '一致', 'high', raw, f'高亮{item.hl_type}命中: {item.text} (译文页{p + 1}, 校准y偏移{yoff:+.0f}pt)'
+            return '一致', 'high', (p, yc, lx0, lx1, raw, key), f'高亮{item.hl_type}命中: {item.text} (译文页{p + 1}, 校准y偏移{yoff:+.0f}pt)'
         if p == item.page + page_off and abs(yoff) <= 40:
-            return '一致', 'medium', raw, f'高亮{item.hl_type}命中(位移较大): {item.text} (译文页{p + 1}, 校准y偏移{yoff:+.0f}pt)'
-        return ('中风险', 'low', raw,
+            return '一致', 'medium', (p, yc, lx0, lx1, raw, key), f'高亮{item.hl_type}命中(位移较大): {item.text} (译文页{p + 1}, 校准y偏移{yoff:+.0f}pt)'
+        return ('中风险', 'low', (p, yc, lx0, lx1, raw, key),
                 f'需复核(疑串位/错印): 高亮 {item.text} 同页行带内未找到, 命中文在译文页{p + 1} y={yc:.0f}: {raw[:50]}')
     return '高风险', '-', None, f'真缺失: 译文全册未找到高亮内容 {item.text!r}(疑漏印/错印, 必须人工核对)'
 
 
+def hl_key_rect_in_line(doc, pg: int, yc: float, key: str):
+    """在 pg 页 y=yc±6 行内找命中键的精确 x 区间(字符级), 供截图黄框只罩关键词;
+    键跨 span(型号被拆)时返回 None 由调用方回退整行。"""
+    if not key:
+        return None
+    for b in doc[pg].get_text('rawdict')['blocks']:
+        if b.get('type') != 0:
+            continue
+        for l in b.get('lines', []):
+            for s in l.get('spans', []):
+                if not s.get('chars'):
+                    continue
+                ycs = (s['bbox'][1] + s['bbox'][3]) / 2
+                if abs(ycs - yc) > 6:
+                    continue
+                text = ''.join(ch['c'] for ch in s['chars'])
+                idx = text.find(key)
+                if idx >= 0 and idx + len(key) <= len(s['chars']):
+                    x0 = s['chars'][idx]['bbox'][0]
+                    x1 = s['chars'][idx + len(key) - 1]['bbox'][2]
+                    return fitz.Rect(x0, s['bbox'][1], x1, s['bbox'][3])
+    return None
+
+
 def run_highlight_job(instruction_pdf, data_dir, out=None, log=print):
-    """高亮模式主流程: 指示稿提取 -> 各译文检索比对 -> 报告(复用四档状态)"""
+    """高亮模式主流程: 指示稿提取 -> 各译文检索比对 -> 截图/定位PDF/HTML工作台/Excel."""
     out_dir = out or os.path.join(data_dir, '_高亮校对结果')
-    os.makedirs(out_dir, exist_ok=True)
+    snaps_dir = os.path.join(out_dir, 'snaps')
+    review_dir = os.path.join(out_dir, '复核PDF')
+    os.makedirs(snaps_dir, exist_ok=True)
     anchor_doc = fitz.open(instruction_pdf)
     zones = anchor_zone_rects(anchor_doc)
     items, skipped = extract_highlight_items(anchor_doc, zones, log)
@@ -2375,6 +2404,7 @@ def run_highlight_job(instruction_pdf, data_dir, out=None, log=print):
                    and os.path.abspath(os.path.join(data_dir, f)) != os.path.abspath(instruction_pdf))
     log(f'指示稿: {os.path.basename(instruction_pdf)} | 高亮检查点 {len(items)} | 译文 {len(files)} 个')
     results = []
+    en_marks: dict = {}   # 指示稿侧定位: (page,yc,x0)->{bbox, langs}
     for fname in files:
         lang = lang_code(fname)
         doc = fitz.open(os.path.join(data_dir, fname))
@@ -2382,47 +2412,133 @@ def run_highlight_job(instruction_pdf, data_dir, out=None, log=print):
         y_offs, page_off = hl_page_offset(items, pages)   # 页级/页码偏移校准
         pairs = []
         for i, it in enumerate(items, 1):
-            st, conf, raw, note = hl_compare_lang(it, pages, y_offs.get(it.page, 0.0), page_off)
-            xx = Item(page=it.page, text=raw[:60], bbox=(0, 0, 0, 0), yc=0, n_spans=0) if raw else None
+            st, conf, hit, note = hl_compare_lang(it, pages, y_offs.get(it.page, 0.0), page_off)
+            xx = None
+            if hit is not None:
+                hp, hyc, hx0, hx1, hraw, hkey = hit
+                if hx0 is not None:
+                    xx = Item(page=hp, text=hraw[:60], bbox=(hx0, hyc - 4, hx1, hyc + 4),
+                              yc=hyc, n_spans=0)
+                else:
+                    xx = Item(page=hp, text=hraw[:60], bbox=(0, hyc - 4, 200, hyc + 4),
+                              yc=hyc, n_spans=0)
+                xx.hl_type = hkey or ''   # 借用字段传递命中键(截图黄框定位用)
             pairs.append(Pair(cp=f'HL{i:03d}', page=it.page + 1, en=it, xx=xx,
-                              y_off=None, conf=conf, status=st, note=note))
+                              y_off=round(hit[1] - it.yc, 1) if hit else None,
+                              conf=conf, status=st, note=note))
+        # 问题项: 截图 + 译文定位 PDF
+        lang_snap = os.path.join(snaps_dir, lang)
+        os.makedirs(lang_snap, exist_ok=True)
+        loc_rows = []
+        lname = LANG_NAMES.get(lang, lang)
+        for p in pairs:
+            if p.status == '一致':
+                continue
+            e = p.en
+            # EN 侧: 指示稿高亮区域(黄框)
+            r = fitz.Rect(e.bbox)
+            clip = fitz.Rect(r.x0 - 25, r.y0 - 25, r.x1 + 25, r.y1 + 25) & anchor_doc[e.page].rect
+            snap_marked(anchor_doc[e.page], clip, r & anchor_doc[e.page].rect,
+                        os.path.join(lang_snap, f'{p.cp}_{lang}_EN.png'))
+            key = (e.page, round(e.yc, 1), round(e.bbox[0], 1))
+            en_marks.setdefault(key, {'bbox': e.bbox, 'langs': set(), 'pairs': []})
+            en_marks[key]['langs'].add(lang)
+            en_marks[key]['pairs'].append(p)
+            # XX 侧: 命中键精确区域黄框(键定位失败时退整行) / 未命中=期望位置框
+            if p.xx is not None and p.xx.bbox[2] > 0:
+                pg = min(p.xx.page, doc.page_count - 1)
+                kr = hl_key_rect_in_line(doc, pg, p.xx.yc, p.xx.hl_type)
+                if kr is not None:
+                    xr = fitz.Rect(kr.x0 - 2, kr.y0 - 2, kr.x1 + 2, kr.y1 + 2)
+                else:
+                    xr = fitz.Rect(p.xx.bbox[0], p.xx.yc - 6, p.xx.bbox[2], p.xx.yc + 6)
+                clipx = fitz.Rect(xr.x0 - 30, xr.y0 - 22, xr.x1 + 30, xr.y1 + 22) & doc[pg].rect
+                snap_marked(doc[pg], clipx, xr & doc[pg].rect,
+                            os.path.join(lang_snap, f'{p.cp}_{lang}_XX.png'))
+                loc_rows.append((pg, tuple(xr), f'{p.cp} · {lname} · {p.status}',
+                                 [f'译文页码: {pg + 1}    高亮: {e.text}    命中行: {p.xx.text[:50]}']))
+                p.locate_page = len(loc_rows)
+            else:
+                ey = e.yc + y_offs.get(e.page, 0.0)
+                ex = (e.bbox[0] + e.bbox[2]) / 2
+                pg = min(e.page + page_off, doc.page_count - 1)
+                xr = fitz.Rect(ex - 45, ey - 10, ex + 45, ey + 10)
+                clipx = fitz.Rect(xr.x0 - 25, xr.y0 - 25, xr.x1 + 25, xr.y1 + 25) & doc[pg].rect
+                snap_marked(doc[pg], clipx, xr & doc[pg].rect,
+                            os.path.join(lang_snap, f'{p.cp}_{lang}_XX@期望位置.png'))
+                loc_rows.append((pg, tuple(xr), f'{p.cp} · {lname} · {p.status}',
+                                 [f'译文页码: {pg + 1}    高亮: {e.text}    (期望位置未找到红字)']))
+                p.locate_page = len(loc_rows)
+        if loc_rows:
+            os.makedirs(review_dir, exist_ok=True)
+            build_locate_pdf(os.path.join(data_dir, fname),
+                             os.path.join(review_dir, f'{lang}.pdf'), loc_rows)
         n_ok = sum(1 for p in pairs if p.status == '一致')
-        log(f'  [{lang}] {fname}: 检查点{len(items)} 命中{n_ok} 未命中{len(items)-n_ok}')
+        n_prob = len(pairs) - n_ok
+        log(f'  [{lang}] {fname}: 检查点{len(items)} 一致{n_ok} 问题{n_prob} (定位PDF{len(loc_rows)}页)')
         results.append({'file': fname, 'lang': lang, 'pairs': pairs, 'doc': doc,
                         'path': os.path.join(data_dir, fname), 'n_xx': 0, 'n_sp': 0, 'cc': Counter()})
-    # 高亮清单(首跑人工核对)
+    # 指示稿侧定位 PDF(每个问题检查点一页)
+    en_rows = []
+    for key, info in sorted(en_marks.items()):
+        page0, yc, x0 = key
+        langs = ','.join(sorted(info['langs']))
+        en_rows.append([page0, info['bbox'],
+                        f'客户指示稿 · {page0 + 1}页 · 高亮问题 · 语言: {langs}', []])
+        for p in info['pairs']:
+            p.en_locate_page = len(en_rows)
+    if en_rows:
+        os.makedirs(review_dir, exist_ok=True)
+        build_locate_pdf(instruction_pdf, os.path.join(review_dir, 'EN.pdf'), en_rows)
+    # 高亮清单(首跑人工核对): 主载体在 Excel「高亮清单」sheet; CSV 为辅助(被占用时不阻塞)
     import csv
-    with open(os.path.join(out_dir, '高亮清单.csv'), 'w', newline='', encoding='utf-8-sig') as f:
-        w = csv.writer(f)
-        w.writerow(['页', '内容', '类型', '状态'])
-        for it in items:
-            w.writerow([it.page + 1, it.text, it.hl_type, '检查点'])
-        for pg, t, why in skipped:
-            w.writerow([pg, t, '-', why])
-    # 简易汇总 Excel
+    try:
+        with open(os.path.join(out_dir, '高亮清单.csv'), 'w', newline='', encoding='utf-8-sig') as f:
+            w = csv.writer(f)
+            w.writerow(['页', '内容', '类型', '状态'])
+            for it in items:
+                w.writerow([it.page + 1, it.text, it.hl_type, '检查点'])
+            for pg, t, why in skipped:
+                w.writerow([pg, t, '-', why])
+    except OSError as e:
+        log(f'提示: 高亮清单.csv 写入失败({e.strerror}), 清单以 Excel「高亮清单」sheet 为准')
+    # 汇总 Excel
     import openpyxl
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = '汇总'
-    ws.append(['文件', '语言', '高亮检查点', '命中(一致)', '未命中(待核对)'])
-    for r in results:
-        ok = sum(1 for p in r['pairs'] if p.status == '一致')
-        ws.append([r['file'], r['lang'], len(r['pairs']), ok, len(r['pairs']) - ok])
-    ws2 = wb.create_sheet('明细')
-    ws2.append(['语言', '检查点', '页', '状态', '高亮内容', '译文命中行', '备注'])
     import re as _re
     def _clean(v):
         return _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', str(v)) if isinstance(v, str) else v
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = '汇总'
+    ws.append(['文件', '语言', '高亮检查点', '一致', '中风险', '高风险'])
+    for r in results:
+        c = Counter(p.status for p in r['pairs'])
+        ws.append([r['file'], r['lang'], len(r['pairs']), c['一致'], c['中风险'], c['高风险']])
+    ws2 = wb.create_sheet('明细')
+    ws2.append(['语言', '检查点', '页', '状态', '高亮内容', '译文命中行', '备注'])
     for r in results:
         for p in r['pairs']:
+            if p.status == '一致':
+                continue
             ws2.append([r['lang'], p.cp, p.page, p.status, _clean(p.en.text),
                         _clean(p.xx.text) if p.xx else '', _clean(p.note)])
-    wb.save(os.path.join(out_dir, '高亮校对报告.xlsx'))
+    ws3 = wb.create_sheet('高亮清单')
+    ws3.append(['页', '内容', '类型', '状态'])
+    for it in items:
+        ws3.append([it.page + 1, _clean(it.text), it.hl_type, '检查点'])
+    for pg, t, why in skipped:
+        ws3.append([pg, _clean(t), '-', why])
     xlsx = os.path.join(out_dir, '高亮校对报告.xlsx')
-    log(f'报告: {xlsx}\n清单: 高亮清单.csv(首跑请人工核对提取范围)')
+    wb.save(xlsx)
+    # HTML 工作台(复用红字模式渲染: 默认高风险视图/筛选/点击定位)
+    report_html = os.path.join(out_dir, '数字校对报告.html')
+    build_html(report_html, os.path.basename(instruction_pdf), items, results, snaps_dir)
+    log(f'报告: {xlsx}')
+    log(f'      {report_html}')
+    log('清单: 高亮清单.csv / 高亮清单sheet(首跑请人工核对提取范围)')
     for d in (anchor_doc, *[r['doc'] for r in results]):
         d.close()
-    return xlsx, None, out_dir, out_dir
+    return xlsx, report_html, snaps_dir, out_dir
 
 
 def run_job(base, anchor, data_dir, out=None, log=print):
