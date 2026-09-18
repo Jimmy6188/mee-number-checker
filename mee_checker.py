@@ -850,11 +850,17 @@ def resolve_aggregation(pairs: list[Pair], xx_items: list | None = None):
                 for u in um:
                     ut = TOKEN_RE.findall(u.en.text)
                     diff = _multiset_diff(qtoks, etoks)
-                    if ut and u.en and q.en and abs(u.en.yc - q.en.yc) < 40 \
+                    if ut and u.en and q.en and u.status == '译文未匹配' \
+                            and abs(u.en.yc - q.en.yc) < 40 \
                             and _multiset_eq(diff, ut):
                         matches.append(u)
-                if len(matches) != 1:
-                    continue            # 无匹配或不唯一 -> 保守不合并
+                if not matches:
+                    continue
+                # 多候选: 取 y 最近者; 最近与次近差 <5pt 仍视为歧义, 保守不合并
+                matches.sort(key=lambda u: abs(u.en.yc - q.en.yc))
+                if len(matches) > 1 \
+                        and abs(matches[1].en.yc - q.en.yc) - abs(matches[0].en.yc - q.en.yc) < 5.0:
+                    continue
                 u = matches[0]
                 q.status = '疑聚合差异'
                 q.note = (f'疑聚合差异: 译文将相邻检查点 {u.cp}({u.en.text}) 的数字与 '
@@ -1015,7 +1021,10 @@ def resolve_aggregation(pairs: list[Pair], xx_items: list | None = None):
             if len(xt) <= len(et) or len(xt) - len(et) > 2:
                 continue
             done = False
-            for dh in range(0, len(xt) - len(et) + 1):
+            # dh>=1: 必须存在非空"注释标号前缀"(如 '8 102' 的 8);
+            # dh=0(值开头+尾部多余 token)不是前缀粘连模式, 会误吞型号碎片(2G33VG 的 '2 33'),
+            # 应留给方向一/二的聚合处理。
+            for dh in range(1, len(xt) - len(et) + 1):
                 if xt[dh:dh + len(et)] == et and all(re.fullmatch(r'\d{1,2}', t) for t in xt[:dh]):
                     pre = xt[:dh]
                     old = owner.get(id(it))
@@ -1744,6 +1753,18 @@ def _count_unpaired(items: list, vals: list, pno: int, fp: str, paired_ids: set)
     return n
 
 
+def _count_val_on_page(items: list, pno: int, v: str) -> int:
+    """页级计数: 值 v(数值等价)在该页所有检查点文本中的出现次数。"""
+    n = 0
+    for it in items:
+        if it.page != pno:
+            continue
+        for t in TOKEN_RE.findall(it.text):
+            if _num_eq(t, v):
+                n += 1
+    return n
+
+
 def finalize_statuses(pairs: list, en_items: list, xx_items: list) -> int:
     """报告前状态归一化(保守):
       一致     : 配对上且值相同(含大位移/指纹/编号列/点逗写法, 备注保留)
@@ -1785,11 +1806,16 @@ def finalize_statuses(pairs: list, en_items: list, xx_items: list) -> int:
                 continue
             # 译文未匹配: 期望位置(expect_y)±35pt 内, 同指纹同值的候选存在?
             # 存在 -> 串位(需复核); 不存在 -> 真缺失(不一致)
+            page_recon = []           # 页级计数对账证据: [(值, 译文侧次数, 英文侧次数)]
             def near_exists():
-                # 1) 期望位置±20pt 内同指纹同值(未配对候选优先) -> 串位(需复核)
+                # 1) 期望位置±20pt 内同指纹同值的未配对候选 -> 串位(需复核)
+                # 已被其它检查点配走的同值项不算候选(否则 CO₂ 下标的 2 会被附近的
+                # (2) 列表号误救为串位信号; 无自由候选 = 真缺失)
                 if p.expect_y is not None and vals:
                     for it in xx_items:
                         if it.page != p.en.page or abs(it.yc - p.expect_y) > 20:
+                            continue
+                        if id(it) in paired_xx:
                             continue
                         if p.en.fp and it.fp and it.fp != p.en.fp:
                             continue
@@ -1797,14 +1823,32 @@ def finalize_statuses(pairs: list, en_items: list, xx_items: list) -> int:
                         if any(any(_num_eq(v, t) for t in itoks) for v in vals):
                             return True
                 # 2) 同页有未配对剩余候选(值串位到别处) -> 需复核
-                return _count_unpaired(xx_items, vals or [], p.en.page, p.en.fp, paired_xx) > 0
+                if _count_unpaired(xx_items, vals or [], p.en.page, p.en.fp, paired_xx) > 0:
+                    return True
+                # 3) 同值项全部已被配对: 页级计数对账
+                #    译文侧同值出现次数 < 英文侧 -> 该值确有无对应 -> 真缺失(高风险)
+                #    否则为同值项排列/配对歧义(值未丢) -> 需复核(中风险)
+                #    不做语义推断(化学式下标/单位上标在译文被整词化等情形一律照常报警),
+                #    只把两侧计数当作证据写进备注, 供人工 10 秒内判断
+                for v in (vals or []):
+                    nx = _count_val_on_page(xx_items, p.en.page, v)
+                    ne = _count_val_on_page(en_items, p.en.page, v)
+                    if nx < ne:
+                        page_recon.append((v, nx, ne))
+                        return False
+                return True
             if near_exists():
                 p.status = '需复核'
                 p.note = '需复核(值存在但未配到,疑串位): ' + p.note
             else:
                 # 期望位置无值且无剩余候选: 真缺失(强信号) -> 不一致, 需人工最终确认
                 p.status = '不一致'
-                p.note = '真缺失(期望位置无对应值): ' + p.note
+                if page_recon:
+                    evid = '; '.join(f'译文页{v}出现{nx}次 < 英文{ne}次'
+                                     for v, nx, ne in page_recon)
+                    p.note = f'真缺失(页级计数对账: {evid}, 必须人工核对): ' + p.note
+                else:
+                    p.note = '真缺失(期望位置无对应值): ' + p.note
             changed += 1
         else:
             vals = TOKEN_RE.findall(p.xx.text)
