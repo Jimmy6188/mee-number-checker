@@ -46,6 +46,7 @@ PRUNE_DY_SAME = 120.0  # 值相同(强信号)的候选边: 宽松剪枝
 PRUNE_DX_SAME = 400.0
 PRUNE_DY_LOOSE = 120.0 # 无锚点页的宽松剪枝
 PRUNE_DX_LOOSE = 240.0
+VERSION = 'v1.7'       # 工具版本(写入报告与人工结论 CSV, 供跨项目回流时区分引擎版本)
 REJECT_COST = 70.0     # 分配代价超过此值不成立 -> 未匹配
 CONF_DY_HIGH = 15.0    # 值相同且 Δy<=此值 -> high
 CONF_DY_MED = 12.0     # 值不同但 Δy<=此值 -> medium(真实差异典型形态)
@@ -92,6 +93,8 @@ class Item:
     right_ctx: str = ''  # 骨架上下文: 同行紧邻右侧非红文本头部
     fp: str = ''         # 语义指纹: 数字邻接的语言无关token(单位/型号/符号)
     hl_type: str = ''    # 高亮模式内容类型: num/code/ord/symstr/phrase
+    host: str = ''       # 宿主词: 该红字段被紧邻非红文本包在哪个字母数字词内
+                         # (MXZ-2G33VG 的 '2' -> 'MXZ2G33VG', CO₂ 下标 -> 'CO2', 正文自由数字 -> '')
 
     @property
     def xc(self) -> float:
@@ -111,6 +114,7 @@ class Pair:
     expect_dx: float | None = None  # 页级 x 偏移(供截图定位)
     locate_page: int | None = None    # 该问题在译文定位 PDF 中的页码(1基, 供 HTML 跳转)
     en_locate_page: int | None = None # 英文侧定位 PDF 页码
+    uikey: str = ''                   # 全册唯一条目标识(供 HTML 记录/CSV/对照册深链接共用)
 
 # ---------------- 提取 ----------------
 def is_red_core(color: int) -> bool:
@@ -222,15 +226,21 @@ def _cluster_spans(pno: int, spans: list, others: list) -> list[Item]:
                         text += "" if gap < JOIN_GAP else " "
                 text += sp["text"].strip()
                 prev = sp
+            # NFKC 归一: 英文侧常用 Unicode 上标字符 `²`/`³`, 不归一则 TOKEN_RE 提不到 token,
+            # 该检查点会整条漏出校对范围; 且与译文侧普通数字 `2` 不等价 -> 假"译文多出"。
+            text = unicodedata.normalize('NFKC', text)
             x0 = min(s["bbox"][0] for s in g)
             y0 = min(s["bbox"][1] for s in g)
             x1 = max(s["bbox"][2] for s in g)
             y1 = max(s["bbox"][3] for s in g)
             left, right = _make_ctx(row_others, x0, x1)
+            left = unicodedata.normalize('NFKC', left)
+            right = unicodedata.normalize('NFKC', right)
             fp = extract_fp(text, left, right)
+            host = _host_of(row_others, x0, x1, text)
             items.append(Item(page=pno, text=text, bbox=(x0, y0, x1, y1),
                               yc=(y0 + y1) / 2, n_spans=len(g),
-                              left_ctx=left, right_ctx=right, fp=fp))
+                              left_ctx=left, right_ctx=right, fp=fp, host=host))
     return items
 
 
@@ -242,8 +252,39 @@ def extract_fp(text: str, left_ctx: str = '', right_ctx: str = '', line_full: st
             continue
         m = FP_RE.search(probe)
         if m:
-            return m.group(1).lower().replace(' ', '')
+            # '^' 一并去掉: cm^2 / cm2 / cm² 归一后同一写法
+            return m.group(1).lower().replace(' ', '').replace('^', '')
     return ''
+
+
+def _host_of(others: list, x0: float, x1: float, text: str) -> str:
+    """该红字段被紧邻非红文本包在哪个字母数字词里(仅用于备注归因)。
+    MXZ-2G33VG 的 '2 33' -> 'MXZ233VG'; CO₂ 下标 -> 'CO2'; 正文自由数字 -> ''。
+    连写条件: 几何紧贴(≤1pt) 且 两侧原始 span 文本在接缝处无空白
+    (others 里的文本已 strip, 故另存 lead_ws/trail_ws 两个标志兑空格信息)。"""
+    lh = rh = ''
+    best_l = best_r = 1.01
+    for o in others:                          # o = [x0, x1, text, yc, lead_ws, trail_ws]
+        if o[5]:                              # 左侧文本以空白结尾 -> 不是同一个词
+            continue
+        d = abs(o[1] - x0)
+        if d <= best_l:
+            m = re.search(r'([A-Za-z0-9]+)$', o[2])
+            if m:
+                lh, best_l = m.group(1), d
+        if o[4]:                              # 右侧文本以空白开头 -> 不是同一个词
+            continue
+        d = abs(o[0] - x1)
+        if d <= best_r:
+            m = re.match(r'\s*([A-Za-z0-9]+)', o[2])
+            if m:
+                rh, best_r = m.group(1), d
+    if not (lh or rh):
+        return ''
+    host = re.sub(r'\s+', '', lh + text + rh).upper()
+    if len(host) < 3 or not re.search(r'[A-Z]', host) or not re.search(r'\d', host):
+        return ''
+    return host
 
 
 def anchor_zone_rects(anchor_doc: fitz.Document) -> list:
@@ -319,9 +360,11 @@ def extract_anchor_items(doc: fitz.Document) -> list[Item]:
                         if segs:
                             spans.extend(segs)
                         else:
-                            others.append([bb[0], bb[2], t, (bb[1] + bb[3]) / 2])
+                            others.append([bb[0], bb[2], t, (bb[1] + bb[3]) / 2,
+                                           sp["text"][:1].isspace(), sp["text"][-1:].isspace()])
                     else:
-                        others.append([bb[0], bb[2], t, (bb[1] + bb[3]) / 2])
+                        others.append([bb[0], bb[2], t, (bb[1] + bb[3]) / 2,
+                                       sp["text"][:1].isspace(), sp["text"][-1:].isspace()])
         if spans:
             items.extend(_cluster_spans(pno, spans, others))
     return items
@@ -349,11 +392,15 @@ def extract_items(doc: fitz.Document, color_counter: Counter | None = None) -> l
         page = doc[pno]
         d = page.get_text("dict")
         raw = []   # [(span, is_red)]
+        sib: dict = {}     # id(span) -> 同一 PDF line 的全部 span(上标判据的参照来源)
         for blk in d.get("blocks", []):
             if blk.get("type") != 0:
                 continue
             for line in blk.get("lines", []):
-                for sp in line.get("spans", []):
+                lsp = [s for s in line.get("spans", []) if s["text"].strip()]
+                for sp in lsp:
+                    sib[id(sp)] = lsp
+                for sp in lsp:
                     t = sp["text"].strip()
                     if not t:
                         continue
@@ -397,12 +444,29 @@ def extract_items(doc: fitz.Document, color_counter: Counter | None = None) -> l
                 # 上标字符(²/³/¹/ⁿ): 单位的一部分(如 kgf/cm²), 非独立数字, 不作为检查点
                 if t in ('²', '³', '¹', 'ⁿ', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹', '⁰') or re.fullmatch(r'[²³¹ⁿ⁴⁵⁶⁷⁸⁹⁰]+', t):
                     continue
+                # 上标的另一种写法: 普通数字 + 上标排版(字号明显变小 且 基线明显上移)。
+                # 两侧必须用同一判据剔除, 否则英文写 `²`、译文写 `2` 会产生假"译文多出"。
+                # 注意: CO₂ 类化学式常是"小字号但基线不降", Δ基线≈0 -> 不剔除, 仍转人工。
+                if re.fullmatch(r'\d', t):
+                    # 参照 = 同一 PDF 文本行的其它 span(不限颜色)。
+                    # 实测教训: 放宽到"同行带左侧40pt"会让 F0295 高风险 7→14、J0105 8→19,
+                    # 因为英文与译文的 PDF 切行结构不同, 同一判据在两侧命中对象不同,
+                    # 反而破坏对称性。It 的上标 '2' 单独成 block 属已知残留(有归因标签)。
+                    lsp = sib.get(id(sp), [sp])
+                    peers = [x for x in lsp if x is not sp and x.get('size', 0) > 0]
+                    ref = max(peers, key=lambda x: x['size']) if peers else None
+                    if ref is not None:
+                        d_size = sp['size'] - ref['size']
+                        d_base = sp['origin'][1] - ref['origin'][1]
+                        if d_size < -0.2 * ref['size'] and d_base < -1.0:
+                            continue
                 spans.append(sp)
                 if color_counter is not None:
                     color_counter[f'#{sp["color"]:06x}'] += 1
         # 行聚类(红色): 由 _cluster_spans 统一处理(行聚类+间隔聚合+点号/逗号+骨架)
         others = [[o["bbox"][0], o["bbox"][2], o["text"].strip(),
-                   (o["bbox"][1] + o["bbox"][3]) / 2]
+                   (o["bbox"][1] + o["bbox"][3]) / 2,
+                   o["text"][:1].isspace(), o["text"][-1:].isspace()]
                   for o, red in raw if not red]
         items.extend(_cluster_spans(pno, spans, others))
     return items
@@ -504,7 +568,8 @@ def token_count(a: str) -> int:
     return len(TOKEN_RE.findall(a))
 
 
-def match_page(en_items: list[Item], xx_items: list[Item], page1: int) -> list[Pair]:
+def match_page(en_items: list[Item], xx_items: list[Item], page1: int,
+               margin_out: list | None = None) -> list[Pair]:
     """单页匹配: 页级偏移估计 -> 统一匈牙利全局最优分配 -> 邻域插值二级匹配
 
     设计要点:
@@ -618,6 +683,32 @@ def match_page(en_items: list[Item], xx_items: list[Item], page1: int) -> list[P
                     c -= REWARD_CTX
                 cost_f[a][b] = min(c, REJECT_COST)
         ri, cj = _hungarian(cost_f)
+        if margin_out is not None:
+            # 可行性采集(不影响任何判定): 每行最优/次优代价差 = margin
+            # 同时记一个"值感知 margin": 只把**值不同**的候选当竞争者,
+            # 同值候选互换不影响校对结论, 不应计入风险。
+            amap = dict(zip(ri, cj))
+            for a in range(fe):
+                e = en_items[free_en[a]]
+                row = sorted(cost_f[a])
+                c1 = row[0]
+                c2 = row[1] if len(row) > 1 else REJECT_COST
+                b = amap.get(a, -1)
+                c2_diff = None
+                for bb, cst in enumerate(cost_f[a]):
+                    if cst >= REJECT_COST:
+                        continue
+                    if value_same(e.text, xx_items[free_xx[bb]].text):
+                        continue
+                    if c2_diff is None or cst < c2_diff:
+                        c2_diff = cst
+                margin_out.append(dict(
+                    page=page1, en_id=id(e),
+                    assigned=(cost_f[a][b] if b >= 0 else None),
+                    best=c1, second=c2, margin=round(c2 - c1, 1),
+                    mvalue=(None if c2_diff is None
+                            else round(c2_diff - (cost_f[a][b] if b >= 0 else c1), 1)),
+                    n_cand=sum(1 for v in cost_f[a] if v < REJECT_COST)))
         for a, b in zip(ri, cj):
             if cost_f[a][b] >= REJECT_COST or cost_f[a][b] >= COST_BIG:
                 continue
@@ -718,13 +809,14 @@ def match_page(en_items: list[Item], xx_items: list[Item], page1: int) -> list[P
     return pairs
 
 
-def build_pairs(en_items: list[Item], xx_items: list[Item], en_pages: int, xx_pages: int) -> list[Pair]:
+def build_pairs(en_items: list[Item], xx_items: list[Item], en_pages: int, xx_pages: int,
+                margin_out: list | None = None) -> list[Pair]:
     pairs: list[Pair] = []
     max_page = max(en_pages, xx_pages)
     for p in range(max_page):
         e = [it for it in en_items if it.page == p]
         x = [it for it in xx_items if it.page == p]
-        pairs.extend(match_page(e, x, p + 1))
+        pairs.extend(match_page(e, x, p + 1, margin_out))
     return pairs
 
 
@@ -1048,7 +1140,7 @@ def resolve_aggregation(pairs: list[Pair], xx_items: list | None = None):
 
 # ---------------- 截图 ----------------
 def snap(doc: fitz.Document, pno: int, bbox, path: str):
-    page = doc[pno]
+    page = doc[min(pno, doc.page_count - 1)]   # 页数不一致时不越界(诊断已另行点名)
     r = fitz.Rect(bbox)
     r = fitz.Rect(r.x0 - SNAP_PAD, r.y0 - SNAP_PAD, r.x1 + SNAP_PAD, r.y1 + SNAP_PAD) & page.rect
     pix = page.get_pixmap(clip=r, dpi=SNAP_DPI)
@@ -1112,15 +1204,19 @@ def style_header(ws, ncols):
 
 def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
     wb = Workbook()
+    # 与 HTML 同口径的人工分层(纯呈现层计算, 不改判定)
+    T = triage_partition(results)
 
     # ---- Sheet1 汇总 ----
     ws = wb.active
     ws.title = '汇总'
     headers = ['文件名', '语言', '英文检查点数', '译文红字项', '一致(通过)',
-               '低风险(大位移确认)', '中风险(需复核)', '高风险(不一致)', '结论']
+               '低风险(大位移确认)', '中风险(需复核)', '高风险(不一致)',
+               '人工必看(标准档)', '结论']
     ws.append(headers)
     tot = {k: 0 for k in ['一致', '低风险', '中风险', '高风险']}
     tot_sp = 0
+    tot_must = 0
     for r in results:
         cnt = {k: 0 for k in tot}
         for p in r['pairs']:
@@ -1135,18 +1231,23 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
                  f'必办{cnt["高风险"]} · 复核{cnt["中风险"]}'
                  + (f' · 抽查{cnt["低风险"]}' if cnt['低风险'] else '')
                  + (f' · 框外差异{_off}' if _off else ''))
+        n_must = T['langs'].get(r['lang'], {}).get('必看', 0)
+        tot_must += n_must
         ws.append([r['file'], r['lang'], len(en_items), r['n_xx'],
-                   cnt['一致'], r['n_sp'], cnt['中风险'], cnt['高风险'], concl])
+                   cnt['一致'], r['n_sp'], cnt['中风险'], cnt['高风险'], n_must, concl])
         if problems:
             for c in range(1, len(headers) + 1):
                 ws.cell(row=ws.max_row, column=c).fill = PatternFill('solid', fgColor='FFF2CC')
             ws.cell(row=ws.max_row, column=len(headers)).font = RED_FONT
     ws.append(['总计', '', len(en_items) * len(results), '', tot['一致'], tot_sp,
-               tot['中风险'], tot['高风险'], ''])
+               tot['中风险'], tot['高风险'], tot_must,
+               f"标准档共 {T['est']['std']['n']} 条必看 + {T['est']['std']['cards']} 张同类卡"
+               f" ≈ {T['est']['std']['min']} 分钟"])
     for c in range(1, len(headers) + 1):
         ws.cell(row=ws.max_row, column=c).font = Font(bold=True)
     style_header(ws, len(headers))
-    for c, w in zip(range(1, len(headers) + 1), [34, 8, 13, 11, 10, 14, 14, 14, 12]):
+    for c, w in zip(range(1, len(headers) + 1),
+                    [34, 8, 13, 11, 10, 14, 14, 14, 14, 22]):
         ws.column_dimensions[get_column_letter(c)].width = w
 
     # ---- Sheet2 明细 ----
@@ -1275,6 +1376,13 @@ def build_excel(path, en_file, en_items, results, snaps_dir, color_notes=None):
     lines = [
         ['MEE 多国语数字校对报告说明'],
         [''],
+        ['人工审核三档(HTML 顶部三个按钮, 与本报告同口径)'],
+        ['只抓铁证', '只看高风险(值不同/值在页内对账不上), 最少时间, 漏报风险自担'],
+        ['标准档(推荐)', '高风险 + 英文与译文数字个数不等 + 仅此语言异常 + 每张同类卡 1 条哨兵；'
+                         '其余同类项按成因与页折叠成卡, 整类一次判定'],
+        ['全面', '所有问题项逐条看完(即四档原样)'],
+        ['哨兵的作用', '折叠里如果混了真错, 抽样会撞上; 哨兵条目出错则该卡不应整类确认'],
+        [''],
         ['英文指示稿', en_file],
         ['检查点编号', 'P{页码}-{页内序号}, 以英文指示稿为准, 全语言统一'],
         [''],
@@ -1376,6 +1484,98 @@ figure img.missing{width:200px;height:110px;object-fit:contain;opacity:.35}
 .verdict .v{display:inline-block;padding:1px 8px;border-radius:4px;margin-right:8px;font-weight:600}
 .vv-en{background:#dbeafe}.vv-xx{background:#ffebe9}.v-same{background:#dafbe1}
 .note{color:#57606a;font-size:12px;margin-top:4px}
+/* ---- 三档人工审核视图 ---- */
+.tiers{padding:16px 32px;background:#fff;border-bottom:1px solid #e1e4e8;display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.tiers button{font:inherit;font-size:15px;padding:12px 20px;border-radius:10px;border:2px solid #d0d7de;background:#fff;cursor:pointer;text-align:left;line-height:1.45}
+.tiers button b{display:block;font-size:16px}
+.tiers button span{font-size:12px;color:#57606a}
+.tiers button.active{border-color:#1f3a5f;background:#eef3fa;box-shadow:0 0 0 2px rgba(31,58,95,.12)}
+.hint{padding:10px 32px;background:#fff8c5;border-bottom:1px solid #e1e4e8;font-size:13px}
+.langmap{margin:16px 32px;background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.08);overflow:hidden}
+.langmap>div{padding:10px 16px;font-size:13px;background:#fafbfc;border-bottom:1px solid #e1e4e8;font-weight:600}
+.langmap table{width:100%;border-collapse:collapse;font-size:13px}
+.langmap td,.langmap th{padding:6px 12px;border-bottom:1px solid #f0f2f5;text-align:left}
+.langmap th{font-size:12px;color:#57606a;background:#fcfcfd}
+.langmap tr.pass td{color:#1a7f37}
+.langmap tr.todo td:first-child{font-weight:600}
+.tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:9px;background:#eef2f7;color:#3b4b5e;margin-left:6px}
+.tag.why{background:#dbeafe;color:#0b3d78}.tag.sen{background:#fff1e0;color:#8a4b00}
+section.tierblock{margin:20px 32px;background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.08);overflow:hidden}
+section.tierblock>h2{font-size:15px;padding:12px 20px;background:#fafbfc;border-bottom:1px solid #e1e4e8;display:flex;gap:10px;align-items:baseline}
+section.tierblock>h2 .sub{font-size:12px;color:#57606a;font-weight:400}
+.card{border-top:1px solid #e1e4e8}
+.card>h3{font-size:14px;font-weight:600;padding:11px 20px;background:#fcfcfd;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.card>h3 .meta{font-size:12px;color:#57606a;font-weight:400}
+.card .acts{margin-left:auto;display:flex;gap:8px}
+.card .acts button{font:inherit;font-size:13px;font-weight:600;padding:7px 15px;border-radius:7px;
+  border:2px solid #d0d7de;background:#fff;cursor:pointer}
+.card .acts button:hover{border-color:#8c959f}
+.card .acts button.ok{background:#1a7f37;color:#fff;border-color:#1a7f37}
+.card .acts button.ok:hover{background:#166a2e;border-color:#166a2e}
+.card.done{background:#f2fbf4}
+.card.done>h3:after{content:'✓ 已确认无问题';color:#1a7f37;font-size:13px;font-weight:600}
+.card .rest{display:none}
+.card.open .rest{display:block}
+.card .samps{border-top:1px dashed #e0b4b4}
+.card.boom{background:#fff5f5;border:2px solid #cf222e;border-radius:8px}
+.card.boom>h3{background:#ffebe9;color:#cf222e}
+.card.boom>h3:after{content:'⚠ 本类已发现真错 · 需逐条核查';color:#cf222e;font-size:13px;font-weight:700}
+.card .acts button.ok[disabled]{background:#eaeef2;color:#8c959f;border-color:#d0d7de;cursor:not-allowed}
+.card .acts button.ok.confirm{background:#bf8700;border-color:#bf8700;color:#fff}
+.item .mk{display:flex;gap:10px;margin-top:10px}
+.item .mk button.mkb{font:inherit;font-size:14px;font-weight:600;min-width:126px;padding:9px 20px;
+  border-radius:8px;border:2px solid #d0d7de;background:#fff;color:#57606a;cursor:pointer}
+.item .mk button.mkb:hover{border-color:#8c959f;color:#24292f;background:#f6f8fa}
+.item .mk button.no.on{background:#1a7f37;border-color:#1a7f37;color:#fff}
+.item .mk button.bad.on{background:#cf222e;border-color:#cf222e;color:#fff}
+.item.marked-ok{background:#f2fbf4}
+.item.marked-bad{background:#fff5f5;border-left-width:8px}
+.prog{margin-left:auto;font-size:13px;font-weight:400;color:#0969da;background:#ddf4ff;
+  padding:3px 12px;border-radius:12px;white-space:nowrap}
+/* 右侧悬浮审核面板 */
+#panel{position:fixed;right:14px;top:92px;width:238px;background:#fff;border:1px solid #d0d7de;
+  border-radius:10px;box-shadow:0 3px 12px rgba(0,0,0,.14);z-index:30;font-size:13px;overflow:hidden}
+#panel .ph{display:flex;align-items:center;background:#1f3a5f;color:#fff;padding:8px 12px;font-weight:600}
+#panel #pcollapse{margin-left:auto;background:transparent;border:0;color:#fff;font-size:16px;cursor:pointer;line-height:1;padding:0 4px}
+#panel .pb{padding:10px 12px}
+#panel .bar{height:8px;border-radius:4px;background:#eaeef2;overflow:hidden;margin-bottom:8px}
+#panel .bar i{display:block;height:100%;width:0;background:#1a7f37;transition:width .2s}
+#panel #pstat{line-height:1.7;color:#24292f}
+#panel #pstat b{font-size:15px}
+#panel .jump{width:100%;margin:8px 0;font:inherit;font-size:13px;font-weight:600;padding:7px 0;
+  border-radius:7px;border:2px solid #1f3a5f;background:#1f3a5f;color:#fff;cursor:pointer}
+#panel #badlist{color:#cf222e;line-height:1.6;max-height:190px;overflow:auto}
+#panel #badlist a{color:#cf222e}
+#panel #cardstat{margin-top:6px;color:#57606a;font-size:12px}
+#panel #boomwarn{margin-top:8px;display:none;background:#fff1f0;border:1px solid #cf222e;
+  border-radius:7px;padding:7px 9px;color:#cf222e;font-size:12px;line-height:1.5}
+#panel #boomwarn button{margin-top:5px;width:100%;font:inherit;font-size:12px;font-weight:600;
+  padding:5px 0;border-radius:6px;border:1px solid #cf222e;background:#cf222e;color:#fff;cursor:pointer}
+#panel.min .pb{display:none}
+#panel.min{width:44px}
+#panel.min .ph{writing-mode:vertical-rl;padding:10px 12px;letter-spacing:2px}
+.item .head a.book{font-size:12px;color:#fff;background:#0969da;padding:3px 10px;border-radius:10px;
+  text-decoration:none;font-weight:600}
+.item .head a.book:hover{background:#0a5cc2}
+.export{margin:8px 32px 60px;display:flex;gap:10px;align-items:center}
+/* 框外值差异清单与文件诊断 */
+.offbox{margin:14px 32px 0}
+.offbox>button{font:inherit;font-size:13px;font-weight:600;padding:8px 16px;border-radius:8px;
+  border:2px solid #bf8700;background:#fff8c5;color:#7a5c00;cursor:pointer}
+.offbox>button:hover{background:#f2e792}
+.offlist{margin-top:8px;background:#fff;border:1px solid #e0c060;border-radius:8px;padding:10px 14px}
+.offlist table{border-collapse:collapse;font-size:13px;width:100%}
+.offlist th,.offlist td{padding:5px 10px;border-bottom:1px solid #f0f2f5;text-align:left}
+.offlist th{color:#57606a;font-size:12px;background:#fcfcfd}
+.offlist .v-en{background:#dbeafe;font-weight:600}
+.offlist .v-xx{background:#ffebe9;font-weight:600}
+.offlist .tip{margin-top:8px;font-size:12px;color:#57606a}
+.diag{margin:12px 32px 0;background:#fff5f5;border:1px solid #cf222e;border-radius:8px;padding:10px 14px;font-size:13px}
+.diag>b{color:#cf222e;display:block;margin-bottom:4px}
+.diag .d-err{color:#cf222e}
+.diag .d-warn{color:#9a6700}
+.export button{font:inherit;font-size:13px;padding:8px 16px;border-radius:8px;border:1px solid #1f3a5f;background:#1f3a5f;color:#fff;cursor:pointer}
+.export span{font-size:12px;color:#57606a}
 """
 
 
@@ -1387,20 +1587,289 @@ def _b64(path: str):
         return None
 
 
-def build_html(path_html: str, en_file: str, en_items: list, results: list, snaps_dir: str):
-    import html as _h
-    from datetime import datetime
+# ---------------- 人工审核分层(纯呈现层, 不改变任何判定与四档) ----------------
+SEC_MUST = 40            # 必看逐条估时(秒): 看双侧截图 + 跳定位 PDF
+SEC_CARD = 45            # 同类卡估时(秒): 看一条样例 + 整类判定
+SENTINEL_PER_CARD = 1    # 纯中/低风险卡的哨兵基数(实际按卡规模分级, 见 _sentinel_n)
+SENT_MAX_TOTAL = 12      # 全报告哨兵总量上限, 防止卡多时必看队列被填重
+CARD_MAX = 10            # 卡数超过此值则改按"成因"单键合并(同成因本就是一回事)
 
-    status_key = {'高风险': '高风险', '中风险': '中风险', '低风险': '低风险'}
-    cnt = Counter()
+
+def _sentinel_n(n: int) -> int:
+    """哨兵条数按卡规模分级: 卡越大抽越多(51 条的卡只抽 1 条等于免检)。"""
+    if n <= 5:
+        return 1
+    if n <= 20:
+        return 2
+    return 3
+
+
+def _susp(p) -> float:
+    """卡内条目可疑度(越大越该被抽): |y偏移| + 置信度权重。
+    卡内项本身就是"位置异常"类, 偏移最大的最可能是真错而非仅排版差异。"""
+    y = abs(p.y_off) if p.y_off is not None else 0.0
+    w = {'low': 60.0, 'medium': 25.0, '-': 10.0, 'high': 0.0}.get(p.conf, 0.0)
+    return y + w
+
+
+def _pick_sentinels(its, k: int, seed: str = '', avoid=()):
+    """从卡内条目里抽 k 条哨兵: 跨语言轮转 + 起点由报告指纹决定 + 同语言内取最可疑。
+
+    旧做法是按语言代码字母序取前 k 条, 实测 17 个语言只能覆盖 4 个(同一语言被重复抽),
+    等于对其余语言零抽查。现在: 每语言一个队列(按可疑度降序), 轮转取人,
+    起点按 seed 偏移 -> 同一数据可复现, 不同项目抽到不同语言。
+    its 已按 _susp 降序传入。
+    """
+    if k <= 0 or not its:
+        return [], list(its)
+    by_lang: dict = {}
+    for it in its:                       # its 已按可疑度降序
+        by_lang.setdefault(it[0], []).append(it)
+    # 未被抽过的语言优先(跨卡也不重叠), 同组内按字母序稳定
+    order = sorted(by_lang, key=lambda l: (l in avoid, l))
+    if seed:
+        h = 0
+        for ch in seed:
+            h = (h * 131 + ord(ch)) & 0xFFFFFFFF
+        offset = h % len(order)
+        order = order[offset:] + order[:offset]
+    queues = [list(by_lang[l]) for l in order]
+    picked = []
+    while len(picked) < k and any(queues):
+        for q in queues:
+            if len(picked) >= k:
+                break
+            if q:
+                picked.append(q.pop(0))
+    rest = [it for q in queues for it in q]
+    return picked, rest
+
+
+def triage_cause(note: str) -> str:
+    """问题项成因标签(仅用于同类归组, 与备注原文一致)。"""
+    n = note or ''
+    for k, lab in (('真缺失', '值缺失'), ('真多余', '值多余'), ('数值不同', '值不同'),
+                   ('个数不同', '数字个数不同'),
+                   ('图内红字', '图内红字'), ('目录条目', '目录条目'), ('串位', '疑串位'),
+                   ('聚合', '聚合/粘连'), ('大位移', '大位移'), ('编号列', '编号列对齐'),
+                   ('格式不同', '格式差异')):
+        if k in n:
+            return lab
+    return '其他'
+
+
+def triage_partition(results: list, seed: str = '') -> dict:
+    """把问题项切成 必看队列 / 同类折叠卡(含哨兵抽样), 并算出三档预计时间。
+
+    进入必看的四个特征(方向均已用真实数据验过, 不引入语义判断):
+      1 高风险(值不同 / 页级计数对账不上)
+      2 英文与译文数字个数不等(值可能整体丢失)
+      3 仅此语言异常(同检查点其余语言均正常 -> 强信号)
+      4 每张折叠卡抽 2 条哨兵(量折叠部分的漏报)
+    数字嵌在型号/化学式内(CO₂/R290) 仅影响必看队列内部排序(排后), 不删不降档。
+    """
+    probs = []
     for r in results:
         for p in r['pairs']:
-            if p.status in IGNORED_STATUSES:
-                continue                 # 合并项不重复计数
-            if p.status in status_key:
-                cnt[p.status] += 1
-    n_items = len(en_items) * len(results)
-    n_ok = n_items - sum(cnt.values())
+            if p.status in ('一致',) + IGNORED_STATUSES:
+                continue
+            probs.append((r['lang'], p))
+    # 同一检查点在中/低风险里被多少个语言报(跨语言同现 -> 大概率排版现象)
+    midlow = {}
+    for lang, p in probs:
+        if p.status in ('中风险', '低风险') and p.cp:
+            midlow.setdefault(p.cp, set()).add(lang)
+
+    must, folded = [], []
+    # 跨语言同现合并: 同一(页,值,偏多差)的"页级计数偏多"高风险若在 >=3 个语言出现,
+    # 视为该页标注/排版的系统性现象 -> 折叠成一张同类卡(仍高风险, 哨兵抽 1 条进必看);
+    # 单语言独有的(如某语言真多排一段)保逐条必看。
+    _OVER_RE = re.compile(r'页级计数对账: 译文页(\S+?)出现(\d+)次 > 英文(\d+)次')
+    sig: dict = {}
+    for lang, p in probs:
+        if p.status == '高风险' and p.xx is not None:
+            m = _OVER_RE.search(p.note or '')
+            if m:
+                sig.setdefault((p.xx.page, m.group(1),
+                                int(m.group(2)) - int(m.group(3))), []).append((lang, p))
+    merged = {id(p) for k, v in sig.items() if len({l for l, _ in v}) >= 3 for _l, p in v}
+    for lang, p in probs:
+        note = p.note or ''
+        cause = triage_cause(note)
+        # 归因覆盖: 宿主词形如 CM2/MM2/CO2(字母+单数字) 且值很短 -> 疑上下标标注不一致
+        # (英文用 `²` 字符、译文用上标字号普通 2, 或一侧根本没标红)
+        if p.en is not None and p.en.host and re.fullmatch(r'[A-Z]{1,6}\d', p.en.host):
+            cause = '上下标标注不一致'
+        # 先判跨语言同现合并(否则会被下面的高风险分支先接走, 逐条刷必看队列)
+        if id(p) in merged:
+            folded.append((lang, p, '页级计数偏多(跨语言同现)'))
+            continue
+        if p.status == '高风险':
+            rank = 0.0
+            why = ['值不一致'] if p.xx is not None else \
+                  (['值缺失'] if '真缺失' in note else ['值多余'])
+        elif '个数不同' in note:
+            rank, why = 1.0, ['数字个数不同']
+        elif p.cp and len(midlow.get(p.cp, ())) == 1:
+            rank, why = 2.0, ['仅此语言异常']
+        else:
+            folded.append((lang, p, cause))
+            continue
+        if p.en is not None and p.en.host:
+            rank += 0.5          # 嵌词内: 排到同级最后, 仍照常报警
+        must.append([rank, lang, p, cause, why, ''])
+
+    groups = {}
+    for lang, p, cause in folded:
+        it = p.en if p.en is not None else p.xx
+        groups.setdefault((cause, it.page + 1), []).append((lang, p))
+    # 卡太碎 -> 改按成因单键合并, 把整类一次判完
+    if len(groups) > CARD_MAX:
+        merged = {}
+        for (cause, _page), its in groups.items():
+            merged.setdefault((cause, 0), []).extend(its)
+        groups = merged
+    raw_cards = []
+    for (cause, page), its in sorted(groups.items(),
+                                     key=lambda kv: (kv[0][1], kv[0][0])):
+        its.sort(key=lambda t: -_susp(t[1]))      # 可疑度降序: 最异常的排在前
+        raw_cards.append({'cause': cause, 'page': page, 'its': its, 'n': len(its),
+                          'nlang': len({l for l, _ in its}),
+                          'cid': f'{cause}@第{page}页' if page else cause})
+    # 哨兵: 优先给条数多的卡, 每张按规模分级抽, 全报告总量封顶; 卡内跨语言轮转
+    # 哨兵: 每张卡按规模抽, 全报告总量封顶; 卡内跨语言轮转, 跳卡优先选未抽过的语言
+    total_sen = 0
+    used_langs: set = set()
+    for ci, c in enumerate(sorted(raw_cards, key=lambda c: -c['n'])):
+        c['has_high'] = any(p.status == '高风险' for _l, p in c['its'])
+        k = min(_sentinel_n(c['n']), max(0, SENT_MAX_TOTAL - total_sen))
+        total_sen += k
+        c['sentinels'], c['rest'] = _pick_sentinels(c['its'], k, f'{seed}#{ci}', used_langs)
+        used_langs.update(l for l, _p in c['sentinels'])
+    for c in raw_cards:
+        # 含高风险的卡额外展示 2 条样例(默认可见, 必须整类确认后才算过)
+        if c.get('has_high'):
+            c['samples'], c['rest'] = c['rest'][:2], c['rest'][2:]
+        else:
+            c['samples'], c['rest'] = [], c['rest']
+        for lang, p in c['sentinels']:
+            note = p.note or ''
+            cause = triage_cause(note)
+            must.append([3.5, lang, p, cause, ['抽样哨兵'], c['cid']])
+    must.sort(key=lambda t: t[0])
+    # 只保留还有可看内容的卡(全部被抽走的卡不必再让同事点)
+    cards = [c for c in raw_cards if c['rest'] or c['samples']]
+
+    n_high = sum(1 for _, p in probs if p.status == '高风险')
+    # 铁证档实际要看的 = 必看队列里的高风险条目 + 含高风险的合并卡
+    must_high = [x for x in must if x[2].status == '高风险']
+    card_high = [c for c in cards if any(p.status == '高风险' for _l, p in c['rest'])]
+
+    def mins(n_items, n_cards=0):
+        return round((n_items * SEC_MUST + n_cards * SEC_CARD) / 60)
+
+    est = {
+        'iron': {'n': len(must_high), 'cards': len(card_high), 'min': mins(len(must_high), len(card_high))},
+        'std': {'n': len(must), 'cards': len(cards),
+                'min': mins(len(must), len(cards))},
+        'full': {'n': len(probs), 'min': mins(len(probs))},
+    }
+    est['std']['min'] = min(est['std']['min'], est['full']['min'])
+    langrows = {}
+    for lang, p in probs:
+        d = langrows.setdefault(lang, {'高风险': 0, '中风险': 0, '低风险': 0, '必看': 0})
+        d[p.status] = d.get(p.status, 0) + 1
+    for _, lang, _p, _c, _w, _g in must:
+        langrows.setdefault(lang, {'高风险': 0, '中风险': 0, '低风险': 0, '必看': 0})['必看'] += 1
+    return {'must': must, 'cards': cards, 'est': est, 'probs': probs, 'langs': langrows}
+
+
+# ---------------- 双语对照册 (呈现层, 不改判定) ----------------
+BOOK_DPI = 150            # 定位页重渲染分辨率
+BOOK_SCALE = 0.72         # 图像像素 -> 册页 pt
+BOOK_GAP = 22             # 左右两页间距(像素)
+
+
+def assign_uikeys(results):
+    """给每条问题项分配全册唯一 uikey。
+    必须在 build_pair_book 与 build_html 之前调用: 两者共用同一 key,
+    否则同页多条译文多出项(_snap_tag 的 y 四舍五入相同)会撞成同一个深链接。"""
+    used = set()
+    for r in results:
+        for p in r['pairs']:
+            base = f'{r["lang"]}#{_snap_tag(p)}'
+            k, n = base, 1
+            while k in used:
+                n += 1
+                k = f'{base}#{n}'
+            used.add(k)
+            p.uikey = k
+    return len(used)
+
+
+def _locate_page_img(pdf_path, page_no, dpi):
+    """把已生成的定位 PDF 第 page_no 页(1基)渲染成 RGB 图。"""
+    import io as _io
+    from PIL import Image
+    d = fitz.open(pdf_path)
+    try:
+        pix = d[page_no - 1].get_pixmap(dpi=dpi)
+    finally:
+        d.close()
+    return Image.open(_io.BytesIO(pix.tobytes('png'))).convert('RGB')
+
+
+def build_pair_book(results, T, out_pdf, review_dir, log=print):
+    """对照册 = 必看队列每条一页: 左英文定位页 + 右该语言定位页, 并排合并。
+
+    直接复用 build_locate_pdf 已经做好的「每问题独占一页 + 黄底红边」结果,
+    不另画编号/连线/导航条: 一条一页天然不会多框叠加, 也不会挡住要核的数字。
+    返回 {(lang, 条目key): 册页码} 供 HTML 深链接。
+    """
+    import io as _io
+    from PIL import Image
+    en_pdf = os.path.join(review_dir, 'EN.pdf')
+    if not os.path.exists(en_pdf):
+        return {}
+    lang_pdf = {r['lang']: os.path.join(review_dir, f'{r["lang"]}.pdf') for r in results}
+    out = fitz.open()
+    book_map = {}
+    sheet = 0
+    for _rank, lang, p, _cause, _why, _cid in T['must']:
+        pi, xi = p.en_locate_page, p.locate_page
+        xp = lang_pdf.get(lang, '')
+        if not pi or not xi or not os.path.exists(xp):
+            continue
+        try:
+            eimg = _locate_page_img(en_pdf, pi, BOOK_DPI)
+            ximg = _locate_page_img(xp, xi, BOOK_DPI)
+        except Exception:
+            continue
+        sheet += 1
+        W = eimg.width + ximg.width + BOOK_GAP * 3
+        H = max(eimg.height, ximg.height) + BOOK_GAP * 2
+        canvas = Image.new('RGB', (W, H), (255, 255, 255))
+        canvas.paste(eimg, (BOOK_GAP, BOOK_GAP))
+        canvas.paste(ximg, (BOOK_GAP * 2 + eimg.width, BOOK_GAP))
+        buf = _io.BytesIO()
+        canvas.save(buf, 'JPEG', quality=86, optimize=True)
+        page = out.new_page(width=W * BOOK_SCALE, height=H * BOOK_SCALE)
+        page.insert_image(page.rect, stream=buf.getvalue())
+        book_map[p.uikey or f'{lang}#{_snap_tag(p)}'] = sheet
+    if not sheet:
+        out.close()
+        return {}
+    out.save(out_pdf, garbage=3, deflate=True)
+    out.close()
+    log(f'对照册: {sheet} 页(必看队列每条一页) → {os.path.basename(out_pdf)} '
+        f'({os.path.getsize(out_pdf) / 1e6:.1f} MB)')
+    return book_map
+
+
+def build_html(path_html: str, en_file: str, en_items: list, results: list, snaps_dir: str,
+               book_map=None, T=None, diag=None, rpt_key=None):
+    import html as _h
+    from datetime import datetime
 
     def snap_html(lang: str, p: Pair, kind: str) -> str:
         if p.en is None and p.xx is None:
@@ -1449,105 +1918,434 @@ def build_html(path_html: str, en_file: str, en_items: list, results: list, snap
             return inner
         return f'<figure><img src="{img}"><figcaption>{cap}</figcaption></figure>'
 
+    if any(not p.uikey for _r in results for p in _r['pairs']):
+        assign_uikeys(results)
+
+    def item_html(lang: str, p: Pair, why=(), cid: str = '', tier: str = 'must') -> str:
+        st = p.status
+        ev = p.en.text if p.en else '(无)'
+        xv = p.xx.text if p.xx else '(缺失)'
+        same = st == '低风险'
+        pg = p.en.page + 1 if p.en else (p.xx.page + 1 if p.xx else '-')
+        yoff = f'{p.y_off:+.0f}pt' if p.y_off is not None else '—'
+        conf = p.conf if p.conf != '-' else '—'
+        key = p.uikey or f'{lang}|{_snap_tag(p) or "?"}'
+        tags = ''.join(f'<span class="tag why">{_h.escape(w)}</span>' for w in why)
+        bk = book_map.get(key)
+        book_link = (f'<a class="book" target="_blank" href="对照册.pdf#page={bk}">'
+                     f'📖 对照册第{bk}页</a>' if bk else '')
+        attrs = (f'data-status="{st}" data-lang="{lang}" data-key="{_h.escape(key)}" '
+                 f'data-tier="{tier}" data-card="{_h.escape(cid)}" data-page="{pg}" '
+                 f'data-cause="{_h.escape(triage_cause(p.note))}" '
+                 f'data-conf="{_h.escape(conf)}" data-yoff="{_h.escape(yoff)}" '
+                 f'data-en="{_h.escape(ev)}" data-xx="{_h.escape(xv)}" '
+                 f'data-note="{_h.escape(p.note or "")}"')
+        return (
+            f'<div class="item st-{st}" {attrs}>'
+            f'<div class="head"><span class="cp">检查点 {p.cp or "(译文多出)"}</span>'
+            f'<span>{_h.escape(lname(lang))}</span><span>第{pg}页</span>'
+            f'<span>置信度 {conf}</span><span>y偏移 {yoff}</span>'
+            f'<span class="badge b-{st}">{st}</span>{tags}{book_link}</div>'
+            f'<div class="compare">{snap_html(lang, p, "EN")}'
+            f'<div class="vs">VS</div>{snap_html(lang, p, "XX")}</div>'
+            f'<div class="verdict">'
+            f'<span class="v {"v-same" if same else "vv-en"}">英文: {_h.escape(ev)}</span>'
+            f'<span class="v {"v-same" if same else "vv-xx"}">译文: {_h.escape(xv)}</span>'
+            f'<div class="note">{_h.escape(p.note)}</div>'
+            f'<div class="mk">'
+            f'<button class="mkb no" onclick="mk(this,1)">✓ 不是错</button>'
+            f'<button class="mkb bad" onclick="mk(this,2)">✗ 确定是错</button>'
+            f'</div>'      # .mk
+            f'</div>'      # .verdict
+            f'</div>')     # .item  ← 必须闭合, 否则后续条目被嵌套进来
+
+    if T is None:
+        T = triage_partition(results)
+    book_map = book_map or {}
+    tag_of = {r['lang']: r.get('tag', '') for r in results}
+
+    def lname(lang: str) -> str:
+        """语言中文名 + 文件序号缩写(如「德语 (02De)」), 便于回到目录找文件。"""
+        t = tag_of.get(lang, '')
+        nm = LANG_NAMES.get(lang, lang)
+        return f'{nm} ({t})' if t else nm
+    E = T['est']
+    import hashlib
+    if not rpt_key:
+        rpt_key = hashlib.md5((os.path.abspath(path_html) + en_file).encode('utf-8')).hexdigest()[:10]
+    why_cnt = Counter()
+    for _r, _lang, _p, _c, ws, _g in T['must']:
+        for w in ws:
+            why_cnt[w] += 1
+
     parts = [
         '<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width,initial-scale=1">',
         '<title>数字校对报告</title>',
-        f'<style>{_HTML_CSS}</style></head><body data-filter="all">',
+        f'<style>{_HTML_CSS}</style></head><body data-report="{rpt_key}" data-ver="{VERSION}" data-tier="std">',
         '<header><h1>多国语数字校对报告</h1>',
         f'<div class="meta">英文指示稿: {_h.escape(en_file)} &nbsp;|&nbsp; 语言数: {len(results)} '
-        f'&nbsp;|&nbsp; 检查点: {len(en_items)}/语言 &nbsp;|&nbsp; 生成时间: {datetime.now():%Y-%m-%d %H:%M}</div></header>',
-        '<div class="dash">',
-        f'<div class="stat ok"><b>{n_ok}</b><span>一致</span></div>',
-        f'<div class="stat info"><b>{cnt["低风险"]}</b><span>低风险(大位移)</span></div>',
-        f'<div class="stat warn"><b>{cnt["中风险"]}</b><span>中风险(需复核)</span></div>',
-        f'<div class="stat err"><b>{cnt["高风险"]}</b><span>高风险(不一致)</span></div>',
-        f'<div class="stat"><b>{len(en_items)}×{len(results)}</b><span>检查点总数</span></div>',
+        f'&nbsp;|&nbsp; 检查点: {len(en_items)}/语言 &nbsp;|&nbsp; '
+        f'一致 {sum(1 for r in results for p in r["pairs"] if p.status == "一致")} / '
+        f'{len(en_items) * len(results)} &nbsp;|&nbsp; 生成 {datetime.now():%Y-%m-%d %H:%M}</div></header>',
+        # 三档预设(无需填任何东西)
+        '<div class="tiers">',
+        f'<button data-t="iron" onclick="setTier(this.dataset.t)"><b>只抓铁证</b>'
+        f'<span>约 {E["iron"]["min"]} 分钟 · {E["iron"]["n"]} 条值对不上'
+        + (f' + {E["iron"]["cards"]} 张含高风险的卡' if E['iron'].get('cards') else '')
+        + '</span></button>',
+        f'<button data-t="std" class="active" onclick="setTier(this.dataset.t)"><b>标准档（推荐）</b>'
+        f'<span>约 {E["std"]["min"]} 分钟 · 必看 {E["std"]["n"]} 条 + 同类卡 {E["std"]["cards"]} 张</span></button>',
+        f'<button data-t="full" onclick="setTier(this.dataset.t)"><b>全面</b>'
+        f'<span>约 {E["full"]["min"]} 分钟 · 全部 {E["full"]["n"]} 条逐条看完</span></button>',
         '</div>',
+        '<div class="hint">看不懂就点「标准档」，看完没有异常就可以交付。'
+        '标准档已把最可能是真错的排在前面, 同类排版问题折叠成卡片, 一次判定一整类。</div>',
+        # 右侧悬浮审核面板(滚动不丢进度; 可收起, 收起状态记本机)
+        '<div id="panel"><div class="ph">审核进度<button id="pcollapse" onclick="collapsePanel()">—</button></div>'
+        '<div class="pb"><div class="bar"><i id="barfill"></i></div><div id="pstat"></div>'
+        '<button class="jump" onclick="jumpNext()">跳到下一条未看</button>'
+        '<div id="badlist"></div><div id="cardstat"></div>'
+        '<div id="boomwarn"></div></div></div>',
+        '<main>',
     ]
-    _off_total = sum(r.get('offbox', 0) for r in results)
-    if _off_total:
-        parts.insert(-1, f'<div class="stat"><b>{_off_total}</b><span>框外值差异(不计入,明细留痕)</span></div>')
-
-    # 筛选按钮(按风险颜色)
-    btns = [('all', '全部', '', sum(cnt.values()))]
-    for st, label, col in [('高风险', '高风险', 'btn-high'), ('中风险', '中风险', 'btn-mid'), ('低风险', '低风险', 'btn-low')]:
-        if cnt[st]:
-            btns.append((st, label, col, cnt[st]))
-    parts.append('<div class="filters"><button class="active" data-f="all" onclick="setFilter(this.dataset.f)">'
-                 f'全部 ({btns[0][3]})</button>')
-    for f, label, col, n in btns[1:]:
-        parts.append(f'<button class="{col}" data-f="{f}" onclick="setFilter(this.dataset.f)">{label} ({n})</button>')
-    parts.append('</div><main>')
-
-    # 语言区块
+    # 框外值差异清单(不计入必办, 但不能丢) + 文件诊断
+    off_rows = []
+    for r in results:
+        for p in r['pairs']:
+            if '框外值差异' in (p.note or ''):
+                m = re.search(r'框外值差异: (.*?) → (.*?)\(', p.note or '')
+                off_rows.append((r['lang'], p.cp, p.page,
+                                 m.group(1) if m else (p.en.text if p.en else ''),
+                                 m.group(2) if m else (p.xx.text if p.xx else '')))
+    if off_rows:
+        parts.append(
+            f'<div class="offbox"><button onclick="toggleOff()">⚠ 框外值差异 {len(off_rows)} 处'
+            f'（不在客户红框内, 不计入必办 · 点击查看）</button>'
+            f'<div class="offlist" id="offlist" style="display:none"><table>'
+            f'<tr><th>语言</th><th>检查点</th><th>页</th><th>英文值</th><th>译文值</th></tr>')
+        for l, cp, pg, ev, xv in off_rows:
+            parts.append(f'<tr><td>{_h.escape(lname(l))}</td><td>{_h.escape(cp or "(多出)")}</td>'
+                         f'<td>{pg}</td><td class="v-en">{_h.escape(ev)}</td>'
+                         f'<td class="v-xx">{_h.escape(xv)}</td></tr>')
+        parts.append('</table><div class="tip">这类项工具已按客户红框范围排除, 但数字确实不一致 '
+                     '—— 如要反馈给标注方补红框, 拿这张表即可。</div></div></div>')
+    if diag:
+        parts.append('<div class="diag"><b>文件诊断</b>' + ''.join(
+            f'<div class="d-{("err" if lvl=="错误" else "warn")}">[{lvl}] {_h.escape(fn)}: '
+            f'{_h.escape(msg)}</div>' for fn, lvl, msg in diag) + '</div>')
+    # 首屏: 哪些语言需要动
+    parts.append('<div class="langmap"><div>各语言待办一览（绿色行无需处理）</div><table>')
+    parts.append('<tr><th>语言</th><th>高风险</th><th>必看</th><th>其余折叠</th><th>结论</th></tr>')
     for r in results:
         lang = r['lang']
-        lname = LANG_NAMES.get(lang, lang)
-        probs = [p for p in r['pairs'] if p.status not in ('一致',) + IGNORED_STATUSES]
-        sps = []
-        problems = len(probs)
-        nh = sum(1 for p in probs if p.status == '高风险')
-        nm = sum(1 for p in probs if p.status == '中风险')
-        nl = problems - nh - nm
-        _off = r.get('offbox', 0)
-        concl = ('✓ 通过' if nh + nm == 0 else
-                 f'必办{nh} · 复核{nm}'
-                 + (f' · 抽查{nl}' if nl else '')
-                 + (f' · 框外差异{_off}' if _off else ''))
-        bcolor = '#1a7f37' if nh + nm == 0 else ('#cf222e' if nh else '#bf8700')
-        parts.append(f'<section class="lang" id="lang-{lang}"><h2>'
-                     f'{lname} <span class="fname">{_h.escape(r["file"])} · 检查点{len(en_items)} '
-                     f'· 一致{len(en_items) - problems}</span>'
-                     f'<span class="badge" style="background:{bcolor}">{concl}</span></h2>')
-        if not probs:
-            parts.append('<div class="allpass">✓ 本语言全部通过, 无需处理</div></section>')
-            continue
-        for p in probs:
-            st = p.status
-            ev = p.en.text if p.en else '(无)'
-            xv = p.xx.text if p.xx else '(缺失)'
-            same = p.status == '低风险'
-            vv_en = 'v-same' if same else 'vv-en'
-            vv_xx = 'v-same' if same else 'vv-xx'
-            pg = p.en.page + 1 if p.en else (p.xx.page + 1 if p.xx else '-')
-            yoff = f'{p.y_off:+.0f}pt' if p.y_off is not None else '—'
-            conf = p.conf if p.conf != '-' else '—'
-            parts.append(
-                f'<div class="item st-{st}" data-status="{st}">'
-                f'<div class="head"><span class="cp">检查点 {p.cp or "(译文多出)"}</span>'
-                f'<span>第{pg}页</span><span>置信度 {conf}</span><span>y偏移 {yoff}</span>'
-                f'<span class="badge b-{st}">{st}</span></div>'
-                f'<div class="compare">{snap_html(lang, p, "EN")}'
-                f'<div class="vs">VS</div>{snap_html(lang, p, "XX")}</div>'
-                f'<div class="verdict">'
-                f'<span class="v {vv_en}">英文: {_h.escape(ev)}</span>'
-                f'<span class="v {vv_xx}">译文: {_h.escape(xv)}</span>'
-                f'<div class="note">{_h.escape(p.note)}</div></div></div>')
-        parts.append('</section>')
+        d = T['langs'].get(lang, {'高风险': 0, '必看': 0})
+        nprob = sum(1 for l, _p in T['probs'] if l == lang)
+        nfold = max(0, nprob - d['必看'])
+        concl = ('✓ 无需处理' if nprob == 0 else
+                 ('✓ 无铁证, 仅有排版差异' if not d['高风险'] else f"需处理 {d['高风险']} 处"))
+        parts.append(f'<tr class="{"todo" if d["高风险"] else "pass"}">'
+                     f'<td>{_h.escape(lname(lang))}</td><td>{d.get("高风险", 0)}</td>'
+                     f'<td>{d.get("必看", 0)}</td><td>{nfold}</td><td>{concl}</td></tr>')
+    parts.append('</table></div>')
 
+    # 必看队列
+    parts.append(
+        f'<section class="tierblock" id="must"><h2>必看队列 · {len(T["must"])} 条'
+        f'<span class="sub">'
+        + ' · '.join(f'{k}{v}' for k, v in why_cnt.most_common())
+        + '</span><span class="prog" id="prog"></span></h2>')
+    if not T['must']:
+        parts.append('<div class="allpass">✓ 本轮无需逐条必看项(无高风险/无单语言异常)'
+                     '</div>')
+    for _rank, lang, p, cause, why, cid in T['must']:
+        parts.append(item_html(lang, p, why, cid,
+                               'sentinel' if '抽样哨兵' in why else 'must'))
+    parts.append('</section>')
+
+    # 同类折叠卡
+    parts.append(f'<section class="tierblock" id="cards"><h2>同类卡 · {len(T["cards"])} 张'
+                 f'<span class="sub">同一页同一成因的问题归为一张, 每张已抽 2 条进必看队列作哨兵</span></h2>')
+    if not T['cards']:
+        parts.append('<div class="allpass">✓ 无可折叠的同类项</div>')
+    for c in T['cards']:
+        has_high = c.get('has_high') or any(p.status == '高风险' for _l, p in c['rest'])
+        parts.append(
+            f'<div class="card" data-cid="{_h.escape(c["cid"])}"'
+            + (' data-has-high="1"' if has_high else '')
+            + f' data-n="{c["n"]}" data-sent="{len(c["sentinels"])}">'
+            + '<h3>'
+            f'{_h.escape(c["cause"])}'
+            + (f' · 第{c["page"]}页' if c['page'] else ' · 全册同类 · ')
+            + f'<span class="meta">共 {c["n"]} 条 / 覆盖 {c["nlang"]} 个语言'
+            + (f'，已抽 {len(c["sentinels"])} 条到必看队列' if c['sentinels'] else '')
+            + (' · 含高风险, 先看下面样例再整类确认' if has_high else '')
+            + '</span>'
+            f'<span class="acts"><button onclick="opencard(this)">展开逐条</button>'
+            f'<button class="ok" onclick="okcard(this)">整类确认无问题</button></span></h3>')
+        if c.get('samples'):
+            parts.append('<div class="samps">')
+            for lang, p in c['samples']:
+                parts.append(item_html(lang, p, ['卡内样例'], c['cid'], 'sample'))
+            parts.append('</div>')
+        if c['rest']:
+            parts.append('<div class="rest">')
+            for lang, p in c['rest']:
+                parts.append(item_html(lang, p, ['同类卡'], c['cid'], 'card'))
+            parts.append('</div>')
+        else:
+            parts.append('<div class="rest"><div class="allpass">'
+                         '本卡全部条已在必看队列里</div></div>')
+        parts.append('</div>')
+    parts.append('</section>')
+
+    parts.append('<div class="export"><button onclick="csv()">导出人工结论 CSV</button>'
+                 '<span>你的点选存在本机浏览器, 关闭页面不丢; 导出的 CSV 带完整判定现场(值/状态/成因/备注/档位/时间), '
+                 '交回给工具维护人用于算折叠漏报率与校准耗时。</span></div>')
     parts.append('</main><script>\n' + _HTML_JS + '\n</script></body></html>')
     with open(path_html, 'w', encoding='utf-8') as f:
         f.write('\n'.join(parts))
 
 
 _HTML_JS = """
-function setFilter(f){
-  document.body.dataset.filter=f;
-  document.querySelectorAll('.item').forEach(function(el){
-    el.style.display=(f==='all'||el.dataset.status===f)?'':'none';
+var RPT=document.body.dataset.report||'x';
+var VER=document.body.dataset.ver||'';
+var LSK='mee_rev_'+RPT, TSK='mee_tier_'+RPT;
+function ls(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v);}catch(e){return null;}}
+function load(){try{return JSON.parse(ls(LSK)||'{}');}catch(e){return {};}}
+var REV=load()||{};
+function save(){try{ls(LSK,JSON.stringify(REV));}catch(e){}}
+function t0(){var k='mee_t0_'+RPT; var s=sessionStorage.getItem(k)||'';
+  if(!s){s=new Date().toISOString();try{sessionStorage.setItem(k,s);}catch(e){}}return s;}
+function esc(s){return (window.CSS&&CSS.escape)?CSS.escape(s):String(s).replace(/["\\\\]/g,'\\\\$&');}
+
+function setTier(t,remember){
+  document.body.dataset.tier=t;
+  document.querySelectorAll('.tiers button').forEach(function(b){b.classList.toggle('active',b.dataset.t===t);});
+  var iron=(t==='iron'), full=(t==='full');
+  document.querySelectorAll('#must .item').forEach(function(el){
+    el.style.display=(iron && el.dataset.status!=='高风险')?'none':'';
   });
-  document.querySelectorAll('section.lang').forEach(function(sec){
-    var vis=[].slice.call(sec.querySelectorAll('.item')).some(function(el){return el.style.display!=='none'});
-    sec.style.display=vis?'':'none';
-  });
-  document.querySelectorAll('.filters button').forEach(function(b){
-    b.classList.toggle('active',b.dataset.f===f);
-  });
+  var cards=document.getElementById('cards');
+  if(cards){
+    var anyHigh=cards.querySelector('.card[data-has-high="1"]');
+    cards.style.display=(iron && !anyHigh)?'none':'';
+    cards.querySelectorAll('.card').forEach(function(c){
+      c.style.display=(iron && c.dataset.hasHigh!=='1')?'none':'';
+      c.classList.toggle('open',full);
+    });
+  }
+  var mb=document.getElementById('must');
+  if(mb){var sub=mb.querySelector('h2 .sub');
+    if(sub){if(!sub.dataset.orig)sub.dataset.orig=sub.textContent;
+      sub.textContent = iron ? '只看值对不上的铁证条目' : (full ? '全面档: 必看队列 + 下方同类卡已全部展开' : sub.dataset.orig);}}
+  if(remember!==false) ls(TSK,t);
 }
-// 默认只看高风险(存在时); 中/低/框外靠筛选按钮切换浏览
+function opencard(btn){
+  var c=btn.closest('.card'); var open=c.classList.toggle('open');
+  btn.textContent=open?'收起':'展开逐条';
+}
+function cardOf(cid){return cid?document.querySelector('.card[data-cid="'+esc(cid)+'"]'):null;}
+function cardHasErr(c){
+  return [].slice.call(c.querySelectorAll('.item')).some(function(e){
+    return ((REV['I@'+e.dataset.key]||{}).v)===2;});
+}
+function boom(cid){
+  var c=cardOf(cid); if(!c||c.classList.contains('boom'))return;
+  c.classList.add('boom'); c.classList.add('open');
+  var b=c.querySelector('.acts button.ok');
+  if(b){b.disabled=true; b.textContent='已有真错, 需逐条核查'; b.classList.remove('confirm');}
+  var o=c.querySelector('.acts button'); if(o) o.textContent='收起';
+  REV['B@'+cid]={t:new Date().toISOString()};
+}
+function unboom(cid){
+  var c=cardOf(cid);
+  if(!c||!c.classList.contains('boom'))return;
+  c.classList.remove('boom');
+  var b=c.querySelector('.acts button.ok');
+  if(b){b.disabled=false; b.textContent='整类确认无问题'; b.classList.remove('confirm');}
+  delete REV['B@'+cid];
+  REV['X@'+cid]={t:new Date().toISOString()};   // 留痕: 曾标错后撑销
+}
+function okcard(btn){
+  var c=btn.closest('.card');
+  if(btn.disabled)return;
+  if(cardHasErr(c)){boom(c.dataset.cid); prog(); return;}   // 卡内已有真错 -> 不允整类放过
+  if(c.classList.contains('done')){                          // 撤销 = 变严格, 一次点击即生效
+    c.classList.remove('done'); delete REV['C@'+c.dataset.cid];
+    c.querySelectorAll('.item').forEach(function(el){mark(el,0);});
+    btn.textContent='整类确认无问题'; btn.classList.remove('confirm');
+    save(); prog(); return;
+  }
+  if(!btn.classList.contains('confirm')){                   // 二次确认(防手滑)
+    btn.classList.add('confirm'); btn.dataset.prev=btn.textContent;
+    btn.textContent='确认这 '+(c.dataset.n||'?')+' 条都无需修改？';
+    clearTimeout(c._t); c._t=setTimeout(function(){
+      btn.classList.remove('confirm'); btn.textContent=btn.dataset.prev;},15000);
+    return;
+  }
+  clearTimeout(c._t); btn.classList.remove('confirm');
+  c.classList.add('done');
+  REV['C@'+c.dataset.cid]={t:new Date().toISOString()};
+  c.querySelectorAll('.item').forEach(function(el){mark(el,1);});
+  btn.textContent='已确认（点此撤销）';
+  save(); prog();
+}
+function mark(el,v){
+  if(v) REV['I@'+el.dataset.key]={v:v,t:new Date().toISOString()};
+  else delete REV['I@'+el.dataset.key];
+  paint(el,REV['I@'+el.dataset.key]?REV['I@'+el.dataset.key].v:0);
+}
+function paint(el,v){
+  el.querySelectorAll('.mk button.mkb').forEach(function(b){
+    b.classList.toggle('on', (b.classList.contains('no')&&v===1)||(b.classList.contains('bad')&&v===2));
+  });
+  el.classList.toggle('marked-ok',v===1);
+  el.classList.toggle('marked-bad',v===2);
+}
+function mk(btn,v){
+  var el=btn.closest('.item'); var cur=(REV['I@'+el.dataset.key]||{}).v||0;
+  var nv=(cur===v)?0:v;
+  mark(el,nv);
+  if(el.dataset.card){                        // 命中即炸开; 撑销后自动恢复
+    var c=cardOf(el.dataset.card);
+    if(c){
+      if(nv===2){
+        if(c.classList.contains('done')){c.classList.remove('done'); delete REV['C@'+c.dataset.cid];}
+        boom(el.dataset.card);
+      } else if(!cardHasErr(c)) { unboom(el.dataset.card); }
+    }
+  }
+  save(); prog();
+}
+function prog(){
+  var els=[].slice.call(document.querySelectorAll('#must .item'));
+  var box=document.getElementById('prog');
+  var boomCards=[].slice.call(document.querySelectorAll('.card.boom'));
+  var extra=[];
+  boomCards.forEach(function(c){[].slice.call(c.querySelectorAll('.item')).forEach(function(e){
+    if(!REV['I@'+e.dataset.key])extra.push(e);});});
+  var total=els.length+extra.length;
+  var done=els.filter(function(e){return !!REV['I@'+e.dataset.key];}).length
+    + extra.filter(function(e){return !!REV['I@'+e.dataset.key];}).length;
+  var bad=[].slice.call(document.querySelectorAll('.item.marked-bad')).length;
+  if(box) box.textContent = total ? ('已看 '+done+' / '+total+' · 待看 '+(total-done)
+    + (bad?(' · 标为错 '+bad):'')) : '';
+  // 右侧面板: 进度条 + 三计数 + 已标错清单 + 卡片进度 + 标签页标题
+  var fill=document.getElementById('barfill');
+  if(fill) fill.style.width=(total?Math.round(100*done/total):100)+'%';
+  var st=document.getElementById('pstat');
+  if(st) st.innerHTML = total
+    ? ('必看 <b>'+total+'</b> 条'+(extra.length?('<span class="tag">含炸开 '+extra.length+'</span>'):'')
+       +'<br>已看 <b>'+done+'</b> · 待看 <b>'+(total-done)+'</b> · 标为错 <b>'+bad+'</b>')
+    : '本轮无必看项';
+  var bl=document.getElementById('badlist');
+  if(bl){
+    var bads=[].slice.call(document.querySelectorAll('.item.marked-bad'));
+    bl.innerHTML = bads.length ? ('<div>已标为错:</div>' + bads.map(function(e){
+      return '<div>· <a href="#" onclick="goto(&#39;'+esc(e.dataset.key)+'&#39;);return false">'
+        +e.dataset.lang+' '+e.dataset.key.split('#').slice(1).join('#')+' '
+        +e.dataset.en+'→'+e.dataset.xx+'</a></div>';}).join('')) : '';
+  }
+  var cs=document.getElementById('cardstat');
+  if(cs){
+    var all=document.querySelectorAll('.card').length, okc=document.querySelectorAll('.card.done').length;
+    cs.textContent = all ? ('同类卡 已确认 '+okc+' / '+all+' 张') : '本轮无同类卡';
+  }
+  var bw=document.getElementById('boomwarn');
+  if(bw){
+    if(boomCards.length){
+      bw.style.display='block';
+      bw.innerHTML='<div>⚠ '+boomCards.length+' 张同类卡已炸开 · 需逐条核查</div>'
+        + boomCards.map(function(c){return '<div>· '+c.dataset.cid
+            +'（'+c.querySelectorAll('.item').length+' 条在卡内）</div>';}).join('')
+        + '<button onclick="gotoBoom()">跳到第一处待核查</button>';
+    } else { bw.style.display='none'; bw.innerHTML=''; }
+  }
+  document.title=(bad?('[错'+bad+'|] '):(done+'/'+total+' '))+'数字校对报告';
+}
+function gotoBoom(){
+  var c=document.querySelector('.card.boom'); if(!c)return;
+  var e=[].slice.call(c.querySelectorAll('.item')).filter(function(x){return !REV['I@'+x.dataset.key];})[0];
+  if(e) goto(e.dataset.key); else c.scrollIntoView({behavior:'smooth',block:'start'});
+}
+function goto(key){
+  var el=document.querySelector('.item[data-key="'+esc(key)+'"]');
+  if(!el)return;
+  var card=el.closest('.card'); if(card)card.classList.add('open');
+  el.scrollIntoView({behavior:'smooth',block:'center'});
+  el.style.outline='3px solid #0969da';
+  setTimeout(function(){el.style.outline='';},2200);
+}
+function jumpNext(){
+  var els=[].slice.call(document.querySelectorAll('#must .item'))
+    .filter(function(e){return e.style.display!=='none' && !REV['I@'+e.dataset.key];});
+  if(!els.length){var c=document.querySelector('.card:not(.done)');
+    if(c){c.scrollIntoView({behavior:'smooth',block:'start'});} return;}
+  goto(els[0].dataset.key);
+}
+function toggleOff(){
+  var el=document.getElementById('offlist'); if(!el)return;
+  el.style.display = (el.style.display==='none')?'':'none';
+}
+function collapsePanel(){
+  var p=document.getElementById('panel');
+  var min=p.classList.toggle('min');
+  document.getElementById('pcollapse').textContent=min?'＋':'—';
+  try{ls('mee_panel_min',min?'1':'0');}catch(e){}
+}
+function restorePanel(){
+  try{ if(ls('mee_panel_min')==='1'){ var p=document.getElementById('panel');
+    p.classList.add('min'); document.getElementById('pcollapse').textContent='＋'; } }catch(e){}
+}
+function csv(){
+  var H=['类型','当前档','卡片/成因','语言','检查点','页','英文值','译文值','工具判定','成因标签',
+         '置信度','y偏移','工具备注原文','人工结论','标记时间','会话开始','工具版本','报告指纹',
+         '卡内条目数','卡内哨兵数','本类是否命中真错','本类曾标错后撑销'];
+  var rows=[H];
+  function cardCols(cid){
+    var c=cardOf(cid);
+    if(!c)return ['','','',''];
+    return [c.dataset.n||'', c.dataset.sent||'',
+            (c.classList.contains('boom')||cardHasErr(c))?'是':'否',
+            REV['X@'+cid]?'是':'否'];
+  }
+  document.querySelectorAll('.item').forEach(function(el){
+    var r=REV['I@'+el.dataset.key]; if(!r)return;
+    rows.push(['条目',document.body.dataset.tier,el.dataset.card||el.dataset.cause,el.dataset.lang,
+      el.dataset.key.split('#').slice(1).join('#'),el.dataset.page,el.dataset.en,el.dataset.xx,
+      el.dataset.status,el.dataset.cause,el.dataset.conf,el.dataset.yoff,el.dataset.note,
+      r.v===2?'确认是错':'不是错',r.t,t0(),VER,RPT].concat(cardCols(el.dataset.card)));
+  });
+  document.querySelectorAll('.card').forEach(function(c){
+    var r=REV['C@'+c.dataset.cid]; if(!r)return;
+    rows.push(['同类卡',document.body.dataset.tier,c.dataset.cid,'','','','','','',
+      c.querySelectorAll('.item').length,'','整类确认无问题',r.t,t0(),VER,RPT]
+      .concat([c.dataset.n||'',c.dataset.sent||'',cardHasErr(c)?'是':'否',REV['X@'+c.dataset.cid]?'是':'否']));
+  });
+  var txt=rows.map(function(r){return r.map(function(x){
+    return '"'+String(x==null?'':x).replace(/"/g,'""')+'"';}).join(',');}).join('\\r\\n');
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob(['\\ufeff'+txt],{type:'text/csv;charset=utf-8'}));
+  a.download='人工结论_'+RPT+'_'+VER+'.csv'; a.click();
+}
 window.addEventListener('DOMContentLoaded',function(){
-  if(document.querySelector('.item[data-status="高风险"]'))setFilter('高风险');
+  Object.keys(REV).forEach(function(k){
+    if(!REV[k])return;
+    if(k.indexOf('I@')===0){
+      var el=document.querySelector('.item[data-key="'+esc(k.slice(2))+'"]');
+      if(el)paint(el,(REV[k].v)||0);
+    }else if(k.indexOf('C@')===0){
+      var c=document.querySelector('.card[data-cid="'+esc(k.slice(2))+'"]');
+      if(c){c.classList.add('done'); var b=c.querySelector('.acts button.ok');
+        if(b)b.textContent='已确认（点此撤销）';}
+    }else if(k.indexOf('B@')===0){
+      boom(k.slice(2));
+    }
+  });
+  setTier(ls(TSK)||'std',false);
+  restorePanel();
+  prog();
 });
 """
 
@@ -1623,6 +2421,8 @@ def align_entry_columns_pairs(pairs: list, en_items: list, xx_items: list) -> in
 def detect_entry_columns_spans(doc: fitz.Document, pno: int) -> list:
     """span 级编号列识别: 同行首编号('1.'/'7)') x同列, 按 y 递增, 至少3个。
     返回 [(x, [(yc, num, span_bbox_x0)...])]"""
+    if pno >= doc.page_count:      # 页数不一致时越界保护(以前直接 IndexError 崩溃)
+        return []
     page = doc[pno]
     d = page.get_text("dict")
     cands = []
@@ -1671,8 +2471,8 @@ def align_entry_columns_spans(pairs: list, en_doc: fitz.Document, xx_doc: fitz.D
     """span级编号列对齐: 对每页, 英文编号列(编号值)与译文编号列按值对齐,
     值相同则把'不一致/待人工'且 y 在编号±8 内的检查点改判'一致(编号列对齐)'。"""
     changed = 0
-    maxp = max(en_doc.page_count, xx_doc.page_count)
-    for pno in range(maxp):
+    # 只对两侧都存在的页做编号列对齐(页数不一致时取交集, 超出部分已在文件诊断里点名)
+    for pno in range(min(en_doc.page_count, xx_doc.page_count)):
         en_cols = detect_entry_columns_spans(en_doc, pno)
         xx_cols = detect_entry_columns_spans(xx_doc, pno)
         if not en_cols or not xx_cols:
@@ -1765,7 +2565,35 @@ def _count_val_on_page(items: list, pno: int, v: str) -> int:
     return n
 
 
-def finalize_statuses(pairs: list, en_items: list, xx_items: list) -> int:
+# ---------------- 英文侧数字词(意译探测, 仅用于备注归因) ----------------
+_NUM_WORDS = {'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5', 'six': '6',
+              'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10', 'eleven': '11',
+              'twelve': '12', 'twenty': '20', 'thirty': '30', 'forty': '40', 'fifty': '50',
+              'sixty': '60', 'seventy': '70', 'eighty': '80', 'ninety': '90'}
+_NUMWORD_RE = re.compile(r'\b(' + '|'.join(_NUM_WORDS) + r')\b', re.I)
+
+
+def page_number_words(doc) -> dict:
+    """扫描英文指示稿每页**非红正文**里的数字词(one/two/...), 返回 {页(0基): {数字串: 原词}}。
+    译文把 `two` 意译成 `2` 时, 译文侧该数字计数会偏多 -> 只写进备注供人 3 秒定性, 不改档位。"""
+    out = {}
+    for pno in range(doc.page_count):
+        found = {}
+        for blk in doc[pno].get_text('dict')['blocks']:
+            for line in blk.get('lines', []):
+                for sp in line.get('spans', []):
+                    if is_red(sp.get('color', 0)):
+                        continue
+                    for m in _NUMWORD_RE.finditer(sp.get('text', '')):
+                        w = m.group(1).lower()
+                        found[_NUM_WORDS[w]] = w
+        if found:
+            out[pno] = found
+    return out
+
+
+def finalize_statuses(pairs: list, en_items: list, xx_items: list,
+                      word_nums: dict | None = None) -> int:
     """报告前状态归一化(保守):
       一致     : 配对上且值相同(含大位移/指纹/编号列/点逗写法, 备注保留)
       不一致   : 真差异/真缺失(对面无剩余候选值)
@@ -1846,12 +2674,31 @@ def finalize_statuses(pairs: list, en_items: list, xx_items: list) -> int:
                 if page_recon:
                     evid = '; '.join(f'译文页{v}出现{nx}次 < 英文{ne}次'
                                      for v, nx, ne in page_recon)
-                    p.note = f'真缺失(页级计数对账: {evid}, 必须人工核对): ' + p.note
+                    where = f'数字嵌于{p.en.host}内' if p.en.host else '正文'
+                    p.note = (f'真缺失({where}, 页级计数对账 {evid}, 必须人工核对): '
+                              + p.note)
                 else:
                     p.note = '真缺失(期望位置无对应值): ' + p.note
             changed += 1
         else:
             vals = TOKEN_RE.findall(p.xx.text)
+            # 页级计数对账(与"英文有/译文找不到"侧对称): 译文侧该值出现次数 > 英文侧
+            # -> 值在译文里多出(疑整段重复排版或英文漏标), 升高风险转人工
+            over = []
+            for v in (vals or []):
+                nx = _count_val_on_page(xx_items, p.xx.page, v)
+                ne = _count_val_on_page(en_items, p.xx.page, v)
+                if nx > ne:
+                    over.append((v, nx, ne))
+            if over:
+                evid = '; '.join(f'译文页{v}出现{nx}次 > 英文{ne}次' for v, nx, ne in over)
+                wn = (word_nums or {}).get(p.xx.page) or {}
+                hit = [f'{wn[v]}→{v}' for v, _nx, _ne in over if v in wn]
+                tag = (f'疑英文数字词意译({", ".join(hit)}), ') if hit else ''
+                p.status = '不一致'
+                p.note = f'真多余({tag}页级计数对账: {evid}, 必须人工核对): ' + p.note
+                changed += 1
+                continue
             # 值在同页英文检查点存在(无论是否已配对) -> 疑串位(需复核)
             exists_same_page = any(
                 it.page == p.xx.page and any(_num_eq(v, t) for t in TOKEN_RE.findall(it.text))
@@ -1950,17 +2797,6 @@ def is_figure_red(text: str, ctx_l: str = '', ctx_r: str = '') -> bool:
     """红字是否在图标注/图形注释区域(易于重排导致位置失真)。仅图注专属词/符号。"""
     s = (ctx_l + ' ' + text + ' ' + ctx_r).lower()
     return any(f.lower() in s for f in FIGURE_FEATURES)
-    """同页同指纹同值、且未被配对的剩余候选数量。"""
-    n = 0
-    for it in items:
-        if it.page != pno or id(it) in paired_ids:
-            continue
-        if fp and it.fp and it.fp != fp:
-            continue
-        itoks = TOKEN_RE.findall(it.text)
-        if vals and any(any(_num_eq(v, t) for t in itoks) for v in vals):
-            n += 1
-    return n
 
 
 # ---------------- 复核 PDF ----------------
@@ -2010,15 +2846,17 @@ def build_locate_pdf(src_pdf: str, out_path: str, rows: list):
             if page0 not in pix_cache:
                 pix_cache[page0] = sp.get_pixmap(dpi=180)
             page.insert_image(fitz.Rect(x0, y0, x0 + w, y0 + h), pixmap=pix_cache[page0])
-            # 问题框: 黄底(半透明) + 红边, 页面上唯一
+            # 问题框: 黄底(半透明) + 细红边, 页面上唯一
             r = fitz.Rect(rect) & sp.rect
+            # 小数字 bbox 仅 8x12pt, 不外扩几乎看不见 -> 四周给点呼吸空间
+            r = fitz.Rect(r.x0 - 7, r.y0 - 3.5, r.x1 + 7, r.y1 + 3.5) & sp.rect
             if r.width >= 1 and r.height >= 1:
                 fr = fitz.Rect(x0 + r.x0 * scale - 2.5, y0 + r.y0 * scale - 2.5,
                                x0 + r.x1 * scale + 2.5, y0 + r.y1 * scale + 2.5) & page.rect
                 shape = page.new_shape()
                 shape.draw_rect(fr)
-                # 黄色半透明高亮覆盖数字区域(无框, 与 PDF 高亮习惯一致)
-                shape.finish(fill=YELLOW, fill_opacity=0.5)
+                # 必须显式给 color: PyMuPDF 不写 color 时默认黑色描边(之前看到的黑框就是它)
+                shape.finish(color=RED, width=0.9, fill=YELLOW, fill_opacity=0.45)
                 shape.commit()
             # 角标: 定位页码 / 总页数
             page.insert_text((555, 830), f'{idx}/{total}', fontsize=8, color=(0.5, 0.5, 0.5))
@@ -2058,6 +2896,12 @@ def lang_code(fname: str) -> str:
     if m:
         return m.group(1)
     return os.path.splitext(fname)[0]
+
+
+def file_tag(fname: str) -> str:
+    """文件名里的序号+语码缩写(供报告标注便于查找): JG79V175H01_02De-校对数字.pdf -> 02De。"""
+    m = re.search(r'_(\d{2}[A-Za-z]{2})', fname)
+    return m.group(1) if m else ''
 
 
 # ---------------- 高亮模式(客户指示稿红框∩青色高亮 = 校对对象) ----------------
@@ -2520,7 +3364,7 @@ def run_highlight_job(instruction_pdf, data_dir, out=None, log=print):
         n_ok = sum(1 for p in pairs if p.status == '一致')
         n_prob = len(pairs) - n_ok
         log(f'  [{lang}] {fname}: 检查点{len(items)} 一致{n_ok} 问题{n_prob} (定位PDF{len(loc_rows)}页)')
-        results.append({'file': fname, 'lang': lang, 'pairs': pairs, 'doc': doc,
+        results.append({'file': fname, 'lang': lang, 'tag': file_tag(fname), 'pairs': pairs, 'doc': doc,
                         'path': os.path.join(data_dir, fname), 'n_xx': 0, 'n_sp': 0, 'cc': Counter()})
     # 指示稿侧定位 PDF(每个问题检查点一页)
     en_rows = []
@@ -2617,23 +3461,71 @@ def run_job(base, anchor, data_dir, out=None, log=print):
              and not ('英文' in f and '校对' not in f) and not f.startswith('英文')]
     files.sort()
     log(f'待校对文件: {len(files)} 个')
+    if not files:
+        allp = [f for f in os.listdir(data_dir) if f.lower().endswith('.pdf')]
+        raise RuntimeError(
+            f'{data_dir} 下共 {len(allp)} 个 PDF, 但全部被当作指示稿/锚定稿排除。\n'
+            f'排除规则: 文件名含 _01En / 0En 或"英文"字样。\n'
+            f'该目录里的文件: {", ".join(allp[:8])}{" …" if len(allp) > 8 else ""}')
 
     results = []
     color_notes = []   # 非标准红提示
+    en_word_nums = page_number_words(en_doc)   # 意译探测(one/two/...), 只用于备注归因
+    # margin 可行性采集(仅环境变量 MEE_MARGIN_DUMP 存在时生效, 不影响判定)
+    margin_dump = os.environ.get('MEE_MARGIN_DUMP') or ''
+    margin_all: dict = {}
     review_dir = os.path.join(out_dir, '复核PDF')
     en_marks: dict = {}   # 英文侧标注: (page,yc,x0) -> {bbox, langs}
     en_orphans: list = []  # 译文多出项: (lang, pair) -> 也入英文定位 PDF(同位置参考页)
     en_sorted_page = {}
     for it in en_sorted:
         en_sorted_page.setdefault(it.page, []).append(it)
+    diag = []   # 逐文件诊断: (文件, 级别, 说明)
+    diag_path = os.path.join(out_dir, '文件诊断.txt')
+    try:
+        if os.path.exists(diag_path):
+            os.remove(diag_path)
+    except OSError:
+        pass
+
+    def diag_note(fn, lvl, msg):
+        """发现问题立即落盘: 中途失败/卡住时诊断信息不能跟着丢。"""
+        diag.append((fn, lvl, msg))
+        try:
+            with open(diag_path, 'a', encoding='utf-8') as f:
+                f.write(f'[{lvl}] {fn}\n    {msg}\n')
+        except OSError:
+            pass
     for fname in files:
         path = os.path.join(data_dir, fname)
         lang = lang_code(fname)
-        doc = fitz.open(path)
+        try:
+            doc = fitz.open(path)
+        except Exception as e:
+            diag_note(fname, '错误', f'文件无法打开: {type(e).__name__}: {e}')
+            log(f'  ✗ {fname}: 无法打开({e}), 已跳过')
+            continue
+        if doc.page_count != en_doc.page_count:
+            dd = doc.page_count - en_doc.page_count
+            diag_note(fname, '警告',
+                      f'页数与英文指示稿不一致: 本文件 {doc.page_count} 页, '
+                      f'指示稿 {en_doc.page_count} 页({"多" if dd > 0 else "少"}{abs(dd)}页)'
+                      f' —— 跳页位移检测会失准, 请确认是否发错版本')
+            log(f'  ! {fname}: 页数 {doc.page_count} 与指示稿 {en_doc.page_count} 不一致'
+                f'({"多" if dd > 0 else "少"}{abs(dd)}页)')
         cc = Counter()
         xx_items = extract_items(doc, cc)
+        if not xx_items:
+            diag_note(fname, '错误',
+                      f'未找到任何红字检查点(共 {doc.page_count} 页): '
+                      f'可能未做 DTP 标红, 或红字颜色不属标准红系')
+            log(f'  ✗ {fname}: 未提取到红字检查点')
         attach_fp(xx_items, doc)
-        pairs = build_pairs(en_items, xx_items, en_doc.page_count, doc.page_count)
+        mbuf = [] if margin_dump else None
+        pairs = build_pairs(en_items, xx_items, en_doc.page_count, doc.page_count, mbuf)
+        if mbuf is not None:
+            for r in mbuf:
+                margin_all[(lang, r['en_id'])] = r
         # 回填检查点编号(匹配页内的编号)
         for p in pairs:
             if p.en is not None:
@@ -2672,13 +3564,13 @@ def run_job(base, anchor, data_dir, out=None, log=print):
             # 编号列对齐(span级): 目录/列表编号按序对齐, 消除排版位移误报
             align_entry_columns_pairs(pairs, en_items, xx_items)
             align_entry_columns_spans(pairs, en_doc, doc)
-        finalize_statuses(pairs, en_items, xx_items)
+        finalize_statuses(pairs, en_items, xx_items, en_word_nums)
         # 非标准红提示: 文件中出现了英文稿没有的红系颜色
         en_main = {c for c, _ in en_color_counter.most_common(3)}
         odd = {c: n for c, n in cc.items() if c not in en_main}
         if odd:
             color_notes.append(f'{lang}: 检测到非英文稿主色的红系颜色 {odd}, 已一并提取, 建议与标注方确认规范')
-        results.append({'file': fname, 'lang': lang, 'pairs': pairs,
+        results.append({'file': fname, 'lang': lang, 'tag': file_tag(fname), 'pairs': pairs,
                         'n_xx': len(xx_items), 'n_sp': 0, 'doc': doc, 'path': path, 'cc': cc,
                         'offbox': offbox})
 
@@ -2686,6 +3578,27 @@ def run_job(base, anchor, data_dir, out=None, log=print):
     n_cross = cross_validate_aggregation(results)
     if n_cross:
         log(f'跨语言交叉验证: {n_cross} 项聚合差异自动判为一致(排版差异)')
+
+    if margin_dump:
+        import csv
+        nw = not os.path.exists(margin_dump)
+        with open(margin_dump, 'a', encoding='utf-8-sig', newline='') as fh:
+            w = csv.writer(fh)
+            if nw:
+                w.writerow(['语言', '页', '检查点', '英文值', '译文值', '最终状态',
+                            '分配代价', '本行最优', '本行次优', 'margin', '有效候选数',
+                            '值感知margin'])
+            for r0 in results:
+                for p in r0['pairs']:
+                    mr = margin_all.get((r0['lang'], id(p.en))) if p.en is not None else None
+                    if mr is None:
+                        continue
+                    w.writerow([r0['lang'], p.page, p.cp, p.en.text,
+                                p.xx.text if p.xx is not None else '', p.status,
+                                '' if mr['assigned'] is None else round(mr['assigned'], 1),
+                                round(mr['best'], 1), round(mr['second'], 1),
+                                mr['margin'], mr['n_cand'],
+                                '' if mr.get('mvalue') is None else mr['mvalue']])
 
     # 统一截图/复核 PDF/统计
     for r in results:
@@ -2823,10 +3736,32 @@ def run_job(base, anchor, data_dir, out=None, log=print):
         os.makedirs(review_dir, exist_ok=True)
         build_locate_pdf(base, os.path.join(review_dir, 'EN.pdf'), en_rows)
 
+    # 逐文件诊断: 已逐条即时落盘, 此处只汇总输出
+    if diag:
+        log(f'\n文件诊断: {len(diag)} 条问题(详见 {diag_path}):')
+        for fn, lvl, msg in diag:
+            log(f'  [{lvl}] {fn}: {msg}')
     report = os.path.join(out_dir, '数字校对报告.xlsx')
     build_excel(report, os.path.basename(base), en_items, results, snaps_dir, color_notes)
+    # 双语对照册(仅呈现层): 一页 = 一个(语言,英文页), 左右整页并排 + 编号框 + 深链接
+    assign_uikeys(results)
+    # 报告指纹: 既做 localStorage 键, 也做哨兵轮转起点(不同项目抽不同语言, 同数据可复现)
+    import hashlib
+    rpt_key = hashlib.md5((os.path.abspath(os.path.join(out_dir, '数字校对报告.html'))
+                           + os.path.basename(base)).encode('utf-8')).hexdigest()[:10]
+    T = triage_partition(results, seed=rpt_key)
+    book_map = {}
+    if T['probs']:
+        try:
+            book_map = build_pair_book(results, T,
+                                       os.path.join(out_dir, '对照册.pdf'),
+                                       review_dir, log=log)
+        except Exception as e:
+            log(f'提示: 对照册生成失败({type(e).__name__}: {e}), '
+                f'报告仍可用截图 + 定位PDF复核')
     report_html = os.path.join(out_dir, '数字校对报告.html')
-    build_html(report_html, os.path.basename(base), en_items, results, snaps_dir)
+    build_html(report_html, os.path.basename(base), en_items, results, snaps_dir,
+               book_map, T, diag=diag, rpt_key=rpt_key)
     log(f'\n报告已生成: {report}')
     log(f'           {report_html}')
     log(f'截图目录:   {snaps_dir}')

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""MEE 多国语数字校对工具 - 图形界面版 (v1.6)
+"""MEE 多国语数字校对工具 - 图形界面版 (v1.7)
 
 用法: 双击运行(或 python mee_checker_gui.py)
 需要: 英文红字指示稿(必填) + 多国语PDF文件夹(必填) + 客户锚定原稿(可选)
@@ -15,7 +15,7 @@ from tkinter import ttk, filedialog, messagebox
 
 import mee_checker
 
-APP_TITLE = 'MEE 多国语数字校对工具 v1.6'
+APP_TITLE = 'MEE 多国语数字校对工具 v1.7'
 
 
 class GUIApp:
@@ -40,7 +40,8 @@ class GUIApp:
                                      values=['red', 'highlight'])
         self.cmb_mode.grid(row=0, column=1, sticky='ew', **pad)
         self.cmb_mode.bind('<<ComboboxSelected>>', self.on_mode_change)
-        self.lbl_mode = ttk.Label(frm, text='红字模式: 校全部红字数字', foreground='#0969da')
+        self.lbl_mode = ttk.Label(frm, text='红字模式: 校全部红字数字 | 指示稿与译文页数需一致',
+                                  foreground='#0969da')
         self.lbl_mode.grid(row=0, column=2, columnspan=1, sticky='w')
 
         # 英文指示稿
@@ -96,11 +97,13 @@ class GUIApp:
         if self.var_mode.get() == 'highlight':
             self.lbl_base.config(text='英文指示稿 (高亮模式不需要):')
             self.lbl_anchor.config(text='客户指示稿 (红框+高亮, 必填):')
-            self.lbl_mode.config(text='高亮模式: 只校红框内青色高亮内容(数字/型号/参数)', foreground='#1a7f37')
+            self.lbl_mode.config(text='高亮模式: 只校红框内青色高亮内容 | 各文件页数需一致',
+                                 foreground='#1a7f37')
         else:
             self.lbl_base.config(text='英文指示稿 (红字标注版):')
             self.lbl_anchor.config(text='客户锚定原稿 (可选):')
-            self.lbl_mode.config(text='红字模式: 校全部红字数字', foreground='#0969da')
+            self.lbl_mode.config(text='红字模式: 校全部红字数字 | 指示稿与译文页数需一致',
+                                 foreground='#0969da')
 
     def pick(self, var: tk.StringVar, kind: str):
         if kind == 'pdf':
@@ -159,7 +162,19 @@ class GUIApp:
         except Exception as e:
             import traceback
             self.done(False, None)
-            self.log(f'发生异常: {e}', 'err')
+            # 先给一句人可读的原因, 再附原始异常与堆栈供维护人排查
+            txt = str(e)
+            hint = ''
+            if 'no such file' in txt.lower() or 'not found' in txt.lower() or '找不到' in txt:
+                hint = '原因: 所选 PDF 文件不存在或已被移动, 请重新选择。'
+            elif 'cannot open' in txt.lower() or 'encrypted' in txt.lower():
+                hint = '原因: 文件损坏或加了口令, 请确认该 PDF 能正常打开。'
+            elif 'page' in txt.lower() and 'not in document' in txt.lower():
+                hint = '原因: 某份译文页数少于指示稿, 导致跳页越界; 请核对文件版本。'
+            elif '全部被当作指示稿' in txt or '待校对文件: 0' in txt:
+                hint = '原因: 多国语文件夹里没有可校对的译文 PDF(只有英文稿)。'
+            self.log(f'✗ 校对失败: {hint or "见下方详细原因"}', 'err')
+            self.log(f'详细信息: {txt}', 'err')
             self.log(traceback.format_exc(), 'err')
 
     # ---------- 事件泵 ----------
@@ -205,6 +220,22 @@ class GUIApp:
                 self.log('  (高亮模式: 打开 xlsx 与高亮清单.csv 核对提取范围)', 'info')
             self.log(f'  截图: {paths[2]}', 'info')
             self.out_paths = paths
+            # 逐文件诊断(页数不一致/无红字/打不开)必须显眼, 不能混在日志里
+            dfile = os.path.join(out_dir, '文件诊断.txt')
+            if os.path.exists(dfile):
+                try:
+                    with open(dfile, encoding='utf-8') as fh:
+                        txt = fh.read().strip()
+                    n = txt.count('[')
+                    self.log(f'\n⚠ 文件诊断: 发现 {n} 条问题:', 'warn')
+                    for ln in txt.split('\n'):
+                        self.log('  ' + ln, 'err' if ln.startswith('[错误]') else 'warn')
+                    messagebox.showwarning(
+                        APP_TITLE,
+                        f'有 {n} 个文件需要确认(页数不一致/无红字/打不开等),\n'
+                        f'详见日志与 {dfile}')
+                except OSError:
+                    pass
             if self.chk_open.get() and report_html and os.path.exists(report_html):
                 try:
                     import webbrowser
